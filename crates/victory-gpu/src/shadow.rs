@@ -1499,14 +1499,15 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, scales up to 12 on high-core CPUs).
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, capped at 6 by default
+/// so dual-CCD CPUs like 7900X3D do not oversubscribe cores needed by the title's render threads).
 fn wide_threads() -> usize {
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
         std::env::var("VICTORY_WIDE_THREADS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 12)))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 4).clamp(2, 6)))
             .clamp(1, 16)
     })
 }

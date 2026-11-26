@@ -4,7 +4,7 @@
 #
 # Defaults: release build, Xbox Series S (XSS) + 1080p (VICTORY_DISPLAY_MODE=1920x1080),
 # VICTORY_CARD_BUFFERS_MIN_KB=64 (matches cool_fox; saves ~5 GiB RAM / ~2.6 GiB shared),
-# VICTORY_WAIT_RESIDENT=0, VICTORY_LEVELS_ON_DEMAND=1, VICTORY_CARD_AWAKE=1, ReBAR off.
+# VICTORY_LEVELS_ON_DEMAND=1, VICTORY_CARD_AWAKE=1, ReBAR off, safe cool_fox shader defaults.
 #
 # Common switches:
 # -SeriesX          switch from Series S to Series X profile (still defaults to 1080p unless overridden)
@@ -65,17 +65,12 @@ $settings = @{
     # NVIDIA Ada / RTX 4090 specific tuning:
     # - Place >= 64 KiB title buffers directly in VRAM (matches cool_fox pareto-residency: -5 GiB SysRAM, -2.6 GiB shared, -8 ms copies)
     # - Keep ReBAR loose-window offload OFF by default (0) so 24 GiB VRAM stays reserved for textures & card buffers without spilling to shared SysRAM
-    # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (eliminates 60-85s stalls)
-    # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
-    # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32 without busting shader cache across RT toggles
-    # - Enable DXR 1.1 RT Core bridge only when -RayTracing is enabled (zero overhead when RT is off)
+    # - Keep VICTORY_WAIT_RESIDENT at default (1, matching cool_fox Play-VIctory.cmd) so newly allocated texture blocks are mapped before shaders sample them
+    # - Keep VICTORY_GROUP_SYNC at default (2) and exact cool_fox NVIDIA shader translation (no aggressive fast-float/WIDE/FIRSTLANE_OWN shortcuts when RT is off)
+    # - Enable DXR 1.1 RT Core bridge + VICTORY_FIRSTLANE_OWN=1 only when -RayTracing is enabled
     VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_WINDOWS_BAR_MB      = '0'
-    VICTORY_WAIT_RESIDENT       = '0'
     VICTORY_DXR                 = '0'
-    VICTORY_FIRSTLANE_OWN       = '1'
-    # Keep wide workers non-spinning by default so 12 thin-list + game threads never lose cores
-    VICTORY_WIDE_SPIN           = '0'
 }
 if ($Diag) {
     $settings.VICTORY_D3D12_DRED = 'light'
@@ -114,7 +109,8 @@ if ($Safe) {
     $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) {
-    $settings.VICTORY_BVH_BUILDER = '1'
+    $settings.VICTORY_BVH_BUILDER   = '1'
+    $settings.VICTORY_FIRSTLANE_OWN = '1'
     if (-not $NoDxr -and -not $Safe) {
         $settings.VICTORY_DXR = '1'
     }
@@ -141,18 +137,21 @@ if (-not $NoLog) {
     Write-Host "Log: $logPath" -ForegroundColor Cyan
     $enc = New-Object System.Text.UTF8Encoding($false)
     $writer = New-Object System.IO.StreamWriter($logPath, $false, $enc)
-    $writer.AutoFlush = $true
+    $writer.AutoFlush = $false
     $prevEap = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
         & $victory run $Exe --console $Console --execute 2>&1 | ForEach-Object {
             $line = "$_"
-            Write-Host $line
             $writer.WriteLine($line)
+            if ($Diag -or $line -match 'fps,|resources:| WARN | ERROR |build\s+|console\s+|device ready|dxr') {
+                Write-Host $line
+                $writer.Flush()
+            }
         }
     } finally {
         $ErrorActionPreference = $prevEap
-        if ($writer) { $writer.Dispose() }
+        if ($writer) { $writer.Flush(); $writer.Dispose() }
         Pop-Location
     }
 } else {

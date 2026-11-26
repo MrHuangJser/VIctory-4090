@@ -973,6 +973,48 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// Verifies `CARD_COMPARE`'s 8x8 shared-memory reduction on the real hardware
+    /// GPU matches CPU `host::piece_hash` (`torn::hash`) bit-for-bit across 32 pieces.
+    #[test]
+    fn hw_card_compare_matches_cpu_hash() {
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        let compare = compile_cs(&gpu.device, crate::host::CARD_COMPARE).expect("CARD_COMPARE must compile on hardware");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 32;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = gpu.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = gpu.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = gpu.shared_buffer(4 * u64::from(PIECES));
+        let content: Vec<u8> = (0..size).map(|i| ((i.wrapping_mul(31)) ^ (i >> 8) ^ (i / 251)) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let dispatch = |gpu: &mut WarpHarness, mode: u32| {
+            // SAFETY: open list, live buffers, CARD_COMPARE root signature.
+            unsafe {
+                gpu.list.SetComputeRootSignature(&compare.root);
+                gpu.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                gpu.list.SetComputeRootShaderResourceView(1, now_gpu);
+                gpu.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                gpu.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                gpu.list.Dispatch(PIECES, 1, 1);
+            }
+            gpu.submit_and_wait();
+        };
+        dispatch(&mut gpu, 0);
+        dispatch(&mut gpu, 1);
+        for piece in 0..PIECES as usize {
+            // SAFETY: within mapped `differs` and `now`.
+            let d = unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() };
+            let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(piece * PIECE).cast_const(), PIECE) };
+            assert_eq!(d & 1, 0, "hardware piece {piece} unexpectedly differed on unchanged buffer");
+            assert_eq!(d >> 1, crate::host::piece_hash(bytes), "hardware piece {piece} hash mismatch vs torn::hash");
+        }
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another

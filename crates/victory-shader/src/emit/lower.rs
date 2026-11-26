@@ -6300,7 +6300,12 @@ impl<'a> Lower<'a> {
                 None => self.handle(site, src, false, (11, 0))?,
             };
             if Self::wide_loads() {
-                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                for (k, mut x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    if size && root && k == 0 {
+                        let (most, zero) = (self.s.m.i32(1 << 20), self.s.m.i32(0));
+                        let sane = self.s.m.cmp(self.cur, pred::IULT, x, most);
+                        x = self.s.m.select(self.cur, sane, x, zero);
+                    }
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());
@@ -8881,15 +8886,12 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
-                        // shortcut: `VICTORY_FIRSTLANE_OWN=1` (default on) takes the host wave's
-                        // own first lane, exact when the value is the same in every lane of
+                        // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
+                        // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
-                        // Set `VICTORY_FIRSTLANE_OWN=0` to refuse diverging half-wave reads.
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| {
-                            std::env::var_os("VICTORY_FIRSTLANE_OWN").is_none_or(|v| v != "0")
-                        }) {
+                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
                             return int(self, mine);
                         }
                         need(self.cur_ir);

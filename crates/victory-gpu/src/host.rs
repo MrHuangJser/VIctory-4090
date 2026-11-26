@@ -1005,9 +1005,10 @@ fn create() -> windows::core::Result<Host> {
                 "host wave lanes and shader profile"
             );
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
-            if nvidia {
-                // Hardware-verified fast float (MAX_MIN | LEGACY | MED3, FRACT off) +
-                // 128-bit WIDE raw buffer loads (LDG.E.128) on NVIDIA.
+            if nvidia && std::env::var_os("VICTORY_NVIDIA_SHADER_OPT").is_some_and(|v| v == "1") {
+                // Opt-in only (`VICTORY_NVIDIA_SHADER_OPT=1`): default stays 100%
+                // aligned with cool_fox (exact float + scalar raw loads) so Ada
+                // fast-math/wide-load edge cases cannot corrupt lights or PBR/bake shaders.
                 victory_shader::emit::set_host_nvidia(true);
             } else {
                 // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
@@ -2178,6 +2179,7 @@ ByteAddressBuffer now : register(t0);
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 groupshared uint4 parts[64];
+groupshared uint4 reduced[8];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
@@ -2225,7 +2227,7 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
     // 2-barrier 8x8 parallel reduction (14 serial steps vs 63, only 2 barriers total):
-    // avoids the 6-barrier occupancy tax on 2-warp NVIDIA groups while cutting tail latency 4.5x.
+    // writes into dedicated `reduced[8]` so threads 1..7 never race with thread 0 reading `parts[1..7]`.
     if (thread < 8u) {
         uint base = thread * 8u;
         uint4 acc = parts[base];
@@ -2234,14 +2236,14 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
             acc = (acc ^ parts[base + j]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
             acc = acc.yzwx ^ (acc >> 15);
         }
-        parts[thread] = acc;
+        reduced[thread] = acc;
     }
     GroupMemoryBarrierWithGroupSync();
     if (thread != 0u) return;
-    h = parts[0];
+    h = reduced[0];
     [unroll]
     for (uint i = 1u; i < 8u; ++i) {
-        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = (h ^ reduced[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
     if (compare != 0u) {
