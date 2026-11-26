@@ -54,25 +54,24 @@ $settings = @{
     VICTORY_INDIRECT_BATCH      = '2'
     VICTORY_INDIRECT_REST       = '0'
     VICTORY_MAP_THREADS         = '1'
-    VICTORY_TITLE_PRIORITIES    = '0'
     VICTORY_SHOW_AFTER          = '1'
     VICTORY_AMBIENT             = '0.8'
     VICTORY_LEVELS_ON_DEMAND    = '1'
     VICTORY_CARD_AWAKE          = '1'
-    VICTORY_D3D12_DRED          = 'light'
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_SKIP_PIPELINES      = 'none'
     # NVIDIA Ada / RTX 4090 specific tuning:
-    # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (4.32x faster GPU reads, -2 GiB SysRAM)
     # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (eliminates 60-85s stalls)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
     # - Enable DXR 1.1 RT Core bridge on DXR Tier 1.1 hosts
     # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32
-    VICTORY_WINDOWS_BAR_MB      = '2048'
     VICTORY_WAIT_RESIDENT       = '0'
     VICTORY_DXR                 = '1'
     VICTORY_FIRSTLANE_OWN       = '1'
 }
-if (-not $Diag) {
+if ($Diag) {
+    $settings.VICTORY_D3D12_DRED = 'light'
+} else {
     # Keep stdout lean to prevent PowerShell pipe back-pressure
     $settings.VICTORY_LOG = 'warn'
 }

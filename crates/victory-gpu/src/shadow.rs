@@ -492,28 +492,15 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        if let Some(mb) = std::env::var("VICTORY_WINDOWS_BAR_MB")
+        // Opt-in via VICTORY_WINDOWS_BAR_MB (default 0): ReBAR GPU_UPLOAD
+        // mappings are write-combined and very slow if the CPU reads them
+        // back during shadow refresh/compare; prefer DEFAULT VRAM copies
+        // (VICTORY_CARD_BUFFERS_MIN_KB=64) with cached system-RAM CPU twins.
+        std::env::var("VICTORY_WINDOWS_BAR_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            return mb << 20;
-        }
-        // Auto-enable 2048 MiB ReBAR window offload on NVIDIA GPUs with
-        // Resizable BAR (GPUUploadHeapSupported), >= 20 GiB VRAM, and <= 36 GiB
-        // system RAM: verified 4.32x faster GPU reads (453 vs 105 GB/s) and
-        // saves 2 GiB of system RAM. Set VICTORY_WINDOWS_BAR_MB=0 to disable.
-        let auto_mb = host().and_then(|h| {
-            let vram = h.video_memory().map(|[budget, ..]| budget).unwrap_or(0);
-            let auto = crate::indirect::nvidia(&h.device)
-                && h.mapped_card_memory()
-                && vram >= 20u64 << 30
-                && crate::host::tight_ram();
-            auto.then_some(2048u64)
-        }).unwrap_or(0);
-        if auto_mb > 0 {
-            tracing::info!(mb = auto_mb, "ReBAR GPU_UPLOAD windows auto-enabled (VICTORY_WINDOWS_BAR_MB=0: off)");
-        }
-        auto_mb << 20
+            .unwrap_or(0)
+            << 20
     })
 }
 
@@ -5076,8 +5063,7 @@ fn window() -> u64 {
     *GRID.get_or_init(|| {
         let kb = std::env::var("VICTORY_WINDOW_KB")
             .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .or_else(|| crate::host::tight_ram().then_some(1024));
+            .and_then(|v| v.trim().parse::<u64>().ok());
         grid(kb)
     })
 }
@@ -5116,13 +5102,7 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        match std::env::var("VICTORY_WINDOW_TAILS").ok().as_deref().map(str::trim) {
-            Some("1") => true,
-            Some("0") => false,
-            _ => crate::host::tight_ram(),
-        }
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,

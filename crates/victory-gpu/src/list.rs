@@ -246,23 +246,24 @@ fn idle_most() -> (usize, u64) {
         let count = std::env::var("VICTORY_LIST_POOL_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or_else(|| if crate::host::tight_ram() { 128 } else { 512 })
+            .unwrap_or_else(|| if crate::host::tight_ram() { 320 } else { 512 })
             .clamp(16, 2048);
         tracing::info!(idle_lists = count, "host command list pool limit (VICTORY_LIST_POOL_MAX)");
         (count, 256 << 20)
     })
 }
 
-/// Trims oldest idle host lists (whose D3D12 command allocators never shrink on
-/// Reset) when free physical RAM drops below 6 GiB.
+/// Trims oldest idle host lists only under critical RAM pressure (< 2 GiB free)
+/// so normal 32 GB gameplay keeps a full frame's (~250) command lists pooled
+/// without recreating D3D12 command allocators every frame.
 #[cfg(windows)]
 pub(crate) fn trim_idle(avail_phys: Option<u64>) {
     let Some(avail) = avail_phys else { return };
     const GIB: u64 = 1 << 30;
-    let target = if avail < 3 * GIB {
-        16
-    } else if avail < 6 * GIB {
+    let target = if avail < GIB {
         32
+    } else if avail < 2 * GIB {
+        128
     } else {
         return;
     };
