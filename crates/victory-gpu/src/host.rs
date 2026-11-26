@@ -2760,15 +2760,15 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        if let Some(n) = std::env::var("VICTORY_LATE_WAIT_LISTS")
+        // Dynamic descriptor slots are released immediately on GPU flight
+        // completion (`Detached::release_tables` + `settle_for_fence` retry),
+        // so NVIDIA hosts can keep the full 256-list async flight window
+        // instead of stalling 2-3x per frame at 96 lists.
+        std::env::var("VICTORY_LATE_WAIT_LISTS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-        {
-            return n.max(1);
-        }
-        let lim = victory_shader::emit::view_heap_limit();
-        let capped = lim > 0 && lim < crate::descriptor::host::PORTABLE_VIEWS;
-        if capped { 96 } else { 256 }
+            .unwrap_or(256)
+            .max(1)
     })
 }
 
