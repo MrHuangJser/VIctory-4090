@@ -624,6 +624,17 @@ fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
+fn the_64_bit_node_test_crossing_a_page_boundary_matches_the_reference_on_the_card() {
+    // Place nodes across 64 KiB page boundaries (0x..._FFC0) so both the fast
+    // same-page path and the cross-page directory lookup path in
+    // `bvh_second_half_words` are verified bit-for-bit on hardware and WARP.
+    for base in [0x12_3456_F7C0u64, 0x12_3456_F6C0u64] {
+        let _memory = Memory::at(base);
+        run(true, WHOLE, base + u64::from(NODES), true);
+    }
+}
+
+#[test]
 fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
     // The title's other way: the structure's address in the descriptor
     // (in 256-byte units, 40 bits), a 32-bit pointer from there. Here with

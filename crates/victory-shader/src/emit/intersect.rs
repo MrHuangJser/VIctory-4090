@@ -277,8 +277,10 @@ impl<'a> Lower<'a> {
 
     /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
     /// (`base` computed, `offset` fixed), read four at a time.
+    /// Nodes are always 64-byte aligned, so fixed 16-byte-aligned 4-dword reads
+    /// emit `align = 16` to unlock 128-bit `LDG.E.128` vector loads on Ada/NVIDIA.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let undef = self.s.m.undef(self.s.t.i32);
         let (handle, start_byte) = match at {
             NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
         };
@@ -291,8 +293,15 @@ impl<'a> Lower<'a> {
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
-            let k = self.s.m.i32(node_byte);
-            let byte = self.s.m.bin(c, Bin::Add, byte, k);
+            if node_byte != 0 {
+                let k = self.s.m.i32(node_byte);
+                byte = self.s.m.bin(c, Bin::Add, byte, k);
+            }
+            let align = self.s.m.i32(if base.is_none() && node_byte.is_multiple_of(16) && n == 4 {
+                16
+            } else {
+                4
+            });
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -308,6 +317,86 @@ impl<'a> Lower<'a> {
             }
         }
         out
+    }
+
+    /// Reads the 12 dwords of the second 64-byte half of a 128-byte box32 node.
+    ///
+    /// For `NodeAt::Memory`, a 64-byte-aligned 128-byte node only crosses a 64 KiB
+    /// page boundary when `(low & 0xFFFF) == 0xFFC0` (1 in 1,024 slots). The 99.9%
+    /// fast path reuses the first half's `handle` and `mapped` flag at `byte + 64`,
+    /// avoiding a second page-table directory lookup and avoiding any `Handle` PHI.
+    fn bvh_second_half_words(&mut self, at: NodeAt) -> (Vec<V>, Option<V>) {
+        match at {
+            NodeAt::Buffer { .. } => {
+                let second = self.bvh_second_half(at);
+                (self.bvh_node_words(second, None, 0, 12), None)
+            }
+            NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped,
+            } => {
+                let c = self.cur;
+                let mask = self.s.m.i32(0xFFFF);
+                let boundary = self.s.m.i32(0xFFC0);
+                let page_off = self.s.m.bin(c, Bin::And, low, mask);
+                let crosses = self.s.m.cmp(c, pred::EQ, page_off, boundary);
+                let (cross_block, same_block) = (self.s.m.new_block(), self.s.m.new_block());
+                let join = self.s.m.new_block();
+                self.s
+                    .m
+                    .terminate(c, Term::CondBr(crosses, cross_block, same_block));
+                // Fast path (99.9%): second half stays in the same 64 KiB page.
+                self.cur = same_block;
+                let k64 = self.s.m.i32(64);
+                let same_byte = self.s.m.bin(same_block, Bin::Add, byte, k64);
+                let same_words = self.bvh_node_words(
+                    NodeAt::Buffer {
+                        handle,
+                        byte: same_byte,
+                    },
+                    None,
+                    0,
+                    12,
+                );
+                let same_end = self.cur;
+                self.s.m.terminate(same_end, Term::Br(join));
+                // Boundary path (0.1%): full directory lookup at `low + 64`.
+                self.cur = cross_block;
+                let (low2, high2) = self.address_plus(low, high, 64);
+                let (h2, b2, m2) = self.bvh_memory(low2, high2, None);
+                let cross_words = self.bvh_node_words(
+                    NodeAt::Buffer {
+                        handle: h2,
+                        byte: b2,
+                    },
+                    None,
+                    0,
+                    12,
+                );
+                let cross_end = self.cur;
+                self.s.m.terminate(cross_end, Term::Br(join));
+                // Merge the 12 dwords and mapped flag (pure scalar PHIs).
+                self.cur = join;
+                let i32t = self.s.t.i32;
+                let i1t = self.s.m.type_of(mapped);
+                let mut merged = Vec::with_capacity(12);
+                for n in 0..12 {
+                    let phi = self.s.m.phi(join, i32t);
+                    self.s
+                        .m
+                        .set_phi(phi, vec![(same_words[n], same_end), (cross_words[n], cross_end)]);
+                    merged.push(phi);
+                }
+                let mapped_phi = self.s.m.phi(join, i1t);
+                self.s
+                    .m
+                    .set_phi(mapped_phi, vec![(mapped, same_end), (m2, cross_end)]);
+                (merged, Some(mapped_phi))
+            }
+        }
     }
 
     /// The node's title address, [`bvh::node_address`]: the descriptor's
@@ -334,7 +423,10 @@ impl<'a> Lower<'a> {
     /// current block and leaves `self.cur` at the block it ends in.
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
         let head = self.cur;
+        // Hoist all 16 dwords of the first 64-byte cache line together (4x LDG.E.128)
+        // before branching on box32 vs box16 so both kinds share one coalesced fetch.
         let children = self.bvh_node_words(at, None, 0, 4);
+        let first_words = self.bvh_node_words(at, None, 16, 12);
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -342,24 +434,22 @@ impl<'a> Lower<'a> {
         self.s
             .m
             .terminate(head, Term::CondBr(wide, wide_block, half_block));
-        // 32-bit floats: 24 dwords from byte 16.
+        // 32-bit floats: 12 dwords already loaded + 12 dwords from second 64 bytes.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
-        let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        // (The look for the second half goes on in another block.)
+        let (second_words, second_mapped) = self.bvh_second_half_words(at);
+        let mut floats: Vec<V> = Vec::with_capacity(24);
+        for &w in first_words.iter().chain(second_words.iter()) {
+            floats.push(self.as_float(w));
+        }
         let wide_block = self.cur;
         self.s.m.terminate(wide_block, Term::Br(join));
-        // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
-        // of a dword first.
+        // 16-bit floats: 24 halves in the 12 dwords already loaded (zero extra memory loads).
         self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
-            let mut h = words[n / 2];
+            let mut h = first_words[n / 2];
             if n % 2 == 1 {
                 h = self.s.m.bin(half_block, Bin::LShr, h, k16);
             }
@@ -378,8 +468,8 @@ impl<'a> Lower<'a> {
         // A page that is not there reads zeros, which are a child and a box:
         // no child of it is hit. (The last two boxes of a 128-byte node are in
         // its second half.)
-        let there = match (at, second) {
-            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
+        let there = match (at, second_mapped) {
+            (NodeAt::Memory { mapped: first, .. }, Some(last)) => {
                 let i1t = self.s.m.type_of(first);
                 let mapped = self.s.m.phi(join, i1t);
                 self.s
@@ -467,10 +557,19 @@ impl<'a> Lower<'a> {
     fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray) -> [V; 4] {
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        // The triangle's byte of the dword at byte 60: which of its
-        // vertices barycentric I and J weigh.
-        let id = self.bvh_node_words(at, None, 60, 1)[0];
-        let (k2, k3, k12, k15) = (k(self, 2), k(self, 3), k(self, 12), k(self, 15));
+        // Fetch the entire 64-byte triangle node (5 vertices + id dword) in 4
+        // coalesced 128-bit vector loads (1 cache line, 1 memory round-trip)
+        // instead of 1 dependent id load + 3 dynamic unaligned 96-bit loads.
+        let node_words = self.bvh_node_words(at, None, 0, 16);
+        let id = node_words[15];
+        let verts: [[V; 3]; 5] = std::array::from_fn(|v| {
+            [
+                self.as_float(node_words[3 * v]),
+                self.as_float(node_words[3 * v + 1]),
+                self.as_float(node_words[3 * v + 2]),
+            ]
+        });
+        let (k2, k3, k15) = (k(self, 2), k(self, 3), k(self, 15));
         let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
         let id = self.s.m.bin(c, Bin::LShr, id, shift);
         let i = self.s.m.bin(c, Bin::And, id, k3);
@@ -495,16 +594,21 @@ impl<'a> Lower<'a> {
             let nibble = self.s.m.bin(c, Bin::Shl, n, k2);
             let vertex = self.s.m.bin(c, Bin::LShr, map, nibble);
             let vertex = self.s.m.bin(c, Bin::And, vertex, k15);
-            let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
-            let words = self.bvh_node_words(at, Some(byte), 0, 3);
+            let (v0, v1, v2, v3) = (
+                self.s.m.cmp(c, pred::EQ, vertex, k0),
+                self.s.m.cmp(c, pred::EQ, vertex, k1),
+                self.s.m.cmp(c, pred::EQ, vertex, k2),
+                self.s.m.cmp(c, pred::EQ, vertex, k3),
+            );
             // Relative to the ray's origin.
-            let r: Vec<V> = (0..3)
-                .map(|a| {
-                    let f = self.as_float(words[a]);
-                    self.s.m.bin(c, Bin::Sub, f, ray.origin[a])
-                })
-                .collect();
-            p.push([r[0], r[1], r[2]]);
+            let r: [V; 3] = std::array::from_fn(|a| {
+                let f = self.s.m.select(c, v3, verts[3][a], verts[4][a]);
+                let f = self.s.m.select(c, v2, verts[2][a], f);
+                let f = self.s.m.select(c, v1, verts[1][a], f);
+                let f = self.s.m.select(c, v0, verts[0][a], f);
+                self.s.m.bin(c, Bin::Sub, f, ray.origin[a])
+            });
+            p.push(r);
         }
         // The ray's largest axis z, and x and y after it in an order that
         // keeps the winding.
