@@ -1,18 +1,20 @@
 # Starts the title with settings tuned for NVIDIA RTX 4090 (Ada Lovelace, 24 GB VRAM,
 # Resizable BAR) and 32 GB system RAM hosts (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
-# -Safe         without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing   the title's own ray-traced indirect light: lit interiors, heavier on the GPU
-# -LowRam       force the 32 GB RAM profile (auto-detected on <= 36 GB physical RAM hosts)
-# -Awake        enable async-compute clock keep-awake (off by default on NVIDIA)
-# -Build        target\diag (the default, with diagnostics) or target\release
-# -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Safe             without the newer, faster ways (the first thing to try when something is wrong)
+# -RayTracing       the title's own ray-traced indirect light: lit interiors, heavier on the GPU
+# -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB physical RAM hosts)
+# -SmallCardBuffers experimental: place small buffers (>= 64 KiB) in VRAM (VICTORY_CARD_BUFFERS_MIN_KB=64)
+# -Awake            enable async-compute clock keep-awake (off by default on NVIDIA)
+# -Build            target\diag (the default, with diagnostics) or target\release
+# -More             other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$LowRam,
+    [switch]$SmallCardBuffers,
     [switch]$Awake,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
@@ -36,12 +38,13 @@ $settings = @{
     VICTORY_D3D12_DRED          = 'light'
     VICTORY_SKIP_PIPELINES      = 'none'
     # NVIDIA Ada / RTX 4090 specific tuning:
-    # - Small buffers (>= 64 KiB) placed in 24 GB GDDR6X VRAM instead of crossing PCIe
     # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (4.32x faster GPU reads, -2 GiB SysRAM)
-    # - Divergent s_barrier safety on NVIDIA Warp32 (prevents TDR hangs on non-uniform barriers)
-    VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
+    #   and 100% match `victory.exe shaders` cache keys
     VICTORY_WINDOWS_BAR_MB      = '2048'
-    VICTORY_GROUP_SYNC          = '1'
+}
+if ($SmallCardBuffers) {
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
 }
 if ($Awake) {
     $settings.VICTORY_CARD_AWAKE = '1'
