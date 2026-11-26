@@ -3,6 +3,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe             without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing       the title's own ray-traced indirect light: lit interiors, heavier on the GPU
+# -NoDxr            disable the Phase 1 DXR 1.1 RT Core bridge observer (VICTORY_DXR=1 is on by default)
 # -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB physical RAM hosts)
 # -SmallCardBuffers experimental: place small buffers (>= 64 KiB) in VRAM (VICTORY_CARD_BUFFERS_MIN_KB=64)
 # -Awake            enable async-compute clock keep-awake (off by default on NVIDIA)
@@ -15,6 +16,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$NoDxr,
     [switch]$LowRam,
     [switch]$SmallCardBuffers,
     [switch]$Awake,
@@ -45,7 +47,9 @@ $settings = @{
     # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (4.32x faster GPU reads, -2 GiB SysRAM)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
     #   and 100% match `victory.exe shaders` cache keys
+    # - Enable Phase 1 DXR 1.1 RT Core bridge observer on DXR Tier 1.1 hosts
     VICTORY_WINDOWS_BAR_MB      = '2048'
+    VICTORY_DXR                 = '1'
 }
 if ($SmallCardBuffers) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
@@ -64,11 +68,13 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'
     $settings.VICTORY_LAND_ECHO  = '0'
     $settings.VICTORY_WINDOWS_BAR_MB = '0'
+    $settings.VICTORY_DXR        = '0'
 } else {
     $settings.VICTORY_THIN         = '1'
     $settings.VICTORY_JOIN_PARTS   = '8'
     $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
+if ($NoDxr) { $settings.VICTORY_DXR = '0' }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
