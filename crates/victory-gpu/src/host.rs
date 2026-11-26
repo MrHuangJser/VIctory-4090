@@ -997,6 +997,13 @@ fn create() -> windows::core::Result<Host> {
                 victory_shader::emit::set_host_rdna(rdna);
             }
         }
+        let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, (&raw mut o5).cast(), size_of_val(&o5) as u32)
+            .is_ok()
+        {
+            tracing::info!(raytracing_tier = o5.RaytracingTier.0, "host raytracing tier (11 = DXR 1.1)");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -1049,6 +1056,38 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+
+    /// Queries `ID3D12Device5` (needed for DXR 1.1 `BuildRaytracingAccelerationStructure`).
+    pub(crate) fn device5(&self) -> Option<ID3D12Device5> {
+        self.device.cast::<ID3D12Device5>().ok()
+    }
+
+    /// Whether the host device supports DXR Tier 1.1 (`RayQuery` / inline ray tracing).
+    pub(crate) fn dxr_tier11(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+            // SAFETY: plain CheckFeatureSupport query with matching struct size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS5,
+                        (&raw mut o5).cast(),
+                        size_of_val(&o5) as u32,
+                    )
+                    .is_ok()
+            };
+            ok && o5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0 && self.device5().is_some()
+        })
+    }
+}
+
+impl HostList {
+    /// Queries `ID3D12GraphicsCommandList4` (for recording DXR 1.1 AS builds).
+    #[allow(dead_code)]
+    pub(crate) fn list4(&self) -> Option<ID3D12GraphicsCommandList4> {
+        self.list.cast::<ID3D12GraphicsCommandList4>().ok()
     }
 }
 

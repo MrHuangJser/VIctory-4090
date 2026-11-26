@@ -607,6 +607,9 @@ impl Memory {
             let to = (address + len).min((page + 1) * PAGE) - page * PAGE;
             self.take(page, from as usize, to as usize, true);
         }
+        if let Some(hdr) = crate::dxr::read_header(address) {
+            crate::dxr::note_structure(address, hdr);
+        }
         self.stats.packed += 1;
     }
 
@@ -996,6 +999,9 @@ pub(crate) fn ready(
             }
             m.opens(at);
             if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+                if let Some(hdr) = crate::dxr::read_header(at) {
+                    crate::dxr::note_structure(at, hdr);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
