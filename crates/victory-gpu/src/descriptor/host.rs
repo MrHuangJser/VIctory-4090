@@ -111,6 +111,105 @@ impl Made {
     }
 }
 
+/// Compact 64-bit word bitset for dynamic descriptor slot allocation (`1` = taken, `0` = free).
+/// Scans 64 slots per word with hardware `trailing_ones` / `trailing_zeros` and skips full
+/// 64-slot blocks in a single cycle under `HostHeap::next`.
+struct DynamicBits {
+    len: usize,
+    words: Vec<u64>,
+}
+
+impl DynamicBits {
+    fn new(len: usize) -> Self {
+        let mut words = vec![0u64; len.div_ceil(64)];
+        let tail = len & 63;
+        if tail != 0 {
+            if let Some(last) = words.last_mut() {
+                *last = !((1u64 << tail) - 1);
+            }
+        }
+        Self { len, words }
+    }
+
+    fn is_taken(&self, idx: usize) -> Option<bool> {
+        (idx < self.len).then(|| (self.words[idx >> 6] >> (idx & 63)) & 1 != 0)
+    }
+
+    /// First contiguous run of `n` free (`0`) bits inside `[start, end)`.
+    fn find_run(&self, start: usize, end: usize, n: usize) -> Option<usize> {
+        if n == 0 || start >= end || end - start < n {
+            return None;
+        }
+        let mut pos = start;
+        let mut run = 0usize;
+        while pos < end {
+            let w_idx = pos >> 6;
+            let bit = pos & 63;
+            let avail = (64 - bit).min(end - pos);
+            let mask = if avail == 64 { u64::MAX } else { (1u64 << avail) - 1 };
+            let slice = (self.words[w_idx] >> bit) & mask;
+            if slice == 0 {
+                run += avail;
+                if run >= n {
+                    return Some(pos + avail - run);
+                }
+                pos += avail;
+            } else if slice == mask {
+                run = 0;
+                pos += avail;
+            } else {
+                // Leading zeros in `slice` extend the current run.
+                let free_here = (slice.trailing_zeros() as usize).min(avail);
+                if free_here > 0 {
+                    run += free_here;
+                    if run >= n {
+                        return Some(pos + free_here - run);
+                    }
+                    pos += free_here;
+                } else {
+                    // Skip contiguous taken (`1`) bits in one instruction.
+                    let busy_here = (slice.trailing_ones() as usize).min(avail);
+                    run = 0;
+                    pos += busy_here;
+                }
+            }
+        }
+        None
+    }
+
+    /// Marks `[first, first + n)` as taken (`1`).
+    fn mark(&mut self, first: usize, n: usize) {
+        let mut pos = first;
+        let end = (first + n).min(self.len);
+        while pos < end {
+            let w_idx = pos >> 6;
+            let bit = pos & 63;
+            let count = (64 - bit).min(end - pos);
+            let mask = if count == 64 { u64::MAX } else { ((1u64 << count) - 1) << bit };
+            self.words[w_idx] |= mask;
+            pos += count;
+        }
+    }
+
+    /// Marks `[first, end)` as free (`0`) and returns how many bits were previously taken.
+    fn clear(&mut self, first: usize, end: usize) -> u32 {
+        let mut pos = first;
+        let end = end.min(self.len);
+        let mut cleared = 0u32;
+        while pos < end {
+            let w_idx = pos >> 6;
+            let bit = pos & 63;
+            let count = (64 - bit).min(end - pos);
+            let mask = if count == 64 { u64::MAX } else { ((1u64 << count) - 1) << bit };
+            let prev = self.words[w_idx] & mask;
+            cleared += prev.count_ones();
+            self.words[w_idx] &= !mask;
+            pos += count;
+        }
+        cleared
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -157,7 +256,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, DynamicBits)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1252,7 +1351,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.is_taken((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1422,16 +1521,19 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // On capped 1M heaps (NVIDIA), honor explicit VICTORY_DYNAMIC_SLOTS
+        // while keeping room for title slots (at least 600,000 when null allows).
+        let cap = if null >= 750_000 { null - 600_000 } else { null / 2 };
+        return asked.map_or(DYNAMIC, |n| n.clamp(1 << 16, cap.max(DYNAMIC)));
     }
+    let most = asked.unwrap_or(DYNAMIC << 2);
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
@@ -1542,7 +1644,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, DynamicBits::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1662,27 +1764,14 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough {
+            taken.find_run(cursor, end, n).or_else(|| taken.find_run(0, second_end, n))
+        } else {
+            None
+        };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1699,7 +1788,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.mark(first, n);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -2533,11 +2622,12 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+        if (at as usize) < end {
+            let given = guard.1.clear(at as usize, end);
+            if given > 0 {
+                self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -4742,6 +4832,31 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    #[test]
+    fn dynamic_bits_tracks_runs_across_word_boundaries() {
+        let mut bits = DynamicBits::new(135);
+        assert_eq!(bits.is_taken(0), Some(false));
+        assert_eq!(bits.is_taken(134), Some(false));
+        assert_eq!(bits.is_taken(135), None);
+        // Mark [0..60) and [66..130): leaves 6 free at 60..66 (crosses 64-bit word boundary)
+        // and 5 free at 130..135.
+        bits.mark(0, 60);
+        bits.mark(66, 64);
+        assert_eq!(bits.find_run(0, 135, 7), None);
+        assert_eq!(bits.find_run(0, 135, 6), Some(60));
+        assert_eq!(bits.find_run(61, 135, 5), Some(61));
+        assert_eq!(bits.find_run(66, 135, 5), Some(130));
+        assert_eq!(bits.find_run(66, 135, 6), None);
+        bits.mark(60, 6);
+        assert_eq!(bits.is_taken(63), Some(true));
+        assert_eq!(bits.is_taken(64), Some(true));
+        assert_eq!(bits.find_run(0, 135, 6), None);
+        // Release spanning across three words
+        assert_eq!(bits.clear(58, 132), 72);
+        assert_eq!(bits.find_run(0, 135, 77), Some(58));
+        assert_eq!(bits.find_run(0, 135, 78), None);
     }
 
     #[test]

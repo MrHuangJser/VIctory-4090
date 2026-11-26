@@ -1111,18 +1111,58 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start, the
+/// active fast-float bits, and whether 128-bit wide raw buffer loads are on.
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(host_wide_loads()),
+    ]
 }
 
-static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Bitmask of [`super::rdna`] float fast paths supported by the host GPU.
+static HOST_FLOAT_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether the host GPU is NVIDIA (enables 128-bit `WIDE` raw loads by default).
+static HOST_NVIDIA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
 /// ([`super::rdna_float`]).
 pub fn set_host_rdna(on: bool) {
-    HOST_RDNA.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        HOST_NVIDIA.store(false, std::sync::atomic::Ordering::Relaxed);
+        HOST_FLOAT_MASK.store(super::rdna::ALL, std::sync::atomic::Ordering::Relaxed);
+    } else if !HOST_NVIDIA.load(std::sync::atomic::Ordering::Relaxed) {
+        HOST_FLOAT_MASK.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Tells the translator that the host's shaders run on NVIDIA hardware:
+/// unlocks hardware-verified fast float paths ([`super::rdna::NVIDIA`]:
+/// `MAX_MIN | LEGACY | MED3`, keeping `FRACT` safe) and enables 128-bit
+/// vectorized `WIDE` raw buffer loads (`LDG.E.128`) unless overridden via
+/// `VICTORY_SHADER_OPT`.
+pub fn set_host_nvidia(on: bool) {
+    HOST_NVIDIA.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        HOST_FLOAT_MASK.store(super::rdna::NVIDIA, std::sync::atomic::Ordering::Relaxed);
+    } else if HOST_FLOAT_MASK.load(std::sync::atomic::Ordering::Relaxed) == super::rdna::NVIDIA {
+        HOST_FLOAT_MASK.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether 128-bit wide raw buffer loads (`bitcode::opt::WIDE`) are active
+/// for this host (automatically enabled on NVIDIA unless `VICTORY_SHADER_OPT`
+/// is explicitly set).
+pub(super) fn host_wide_loads() -> bool {
+    if super::shader_opt_explicit() {
+        super::shader_opt() & super::bitcode::opt::WIDE != 0
+    } else {
+        HOST_NVIDIA.load(std::sync::atomic::Ordering::Relaxed)
+            || super::shader_opt() & super::bitcode::opt::WIDE != 0
+    }
 }
 
 #[cfg(test)]
@@ -1137,7 +1177,7 @@ pub(super) fn host_rdna() -> u32 {
     if let Some(bits) = TEST_RDNA.get() {
         return bits;
     }
-    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+    HOST_FLOAT_MASK.load(std::sync::atomic::Ordering::Relaxed) & super::rdna_float()
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -6051,10 +6091,10 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the dwords of one console load are read by one call for up
-    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`), not
-    /// by a call each.
+    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`, or on
+    /// NVIDIA by default), not by a call each.
     fn wide_loads() -> bool {
-        super::shader_opt() & super::bitcode::opt::WIDE != 0
+        host_wide_loads()
     }
 
     /// `count` dwords from byte `addr` on of the raw view `h`, as integers,

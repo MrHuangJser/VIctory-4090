@@ -363,18 +363,61 @@ pub(crate) fn keep_freed() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
 }
 
+/// Total physical RAM installed on this PC, in bytes (0 if unknown).
+pub(crate) fn total_phys_ram() -> u64 {
+    static TOTAL: OnceLock<u64> = OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain struct filled by GlobalMemoryStatusEx with dwLength initialized.
+        let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: valid pointer and initialized dwLength.
+        if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 {
+            st.ullTotalPhys
+        } else {
+            0
+        }
+    })
+}
+
+/// Whether this machine has <= 36 GiB physical RAM (e.g., 32 GB PCs) and
+/// should use tighter system-RAM pools and ReBAR offloading.
+/// `VICTORY_LOW_RAM=1` forces it on; `VICTORY_LOW_RAM=0` forces it off.
+pub(crate) fn tight_ram() -> bool {
+    static TIGHT: OnceLock<bool> = OnceLock::new();
+    *TIGHT.get_or_init(|| {
+        let tight = match std::env::var("VICTORY_LOW_RAM").ok().as_deref().map(str::trim) {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                let total = total_phys_ram();
+                total != 0 && total <= 36u64 << 30
+            }
+        };
+        tracing::info!(
+            total_ram_gib = total_phys_ram() >> 30,
+            tight_ram = tight,
+            "host physical RAM profile (VICTORY_LOW_RAM=0/1)"
+        );
+        tight
+    })
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    ram_idle_for(avail_phys, keep_freed(), tight_ram())
 }
 
-fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
+fn ram_idle_for(avail_phys: Option<u64>, keep: bool, tight: bool) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const KEPT_MS: u64 = 300_000;
-    if keep && avail_phys.is_some_and(|avail| avail >= 12 * GIB) {
+    // On <= 36 GiB RAM systems, avoid holding freed buffers for 5 minutes
+    // unless >= 16 GiB is free; on 64 GiB+ systems keep the original 12 GiB bar.
+    let keep_bar = if tight { 16 * GIB } else { 12 * GIB };
+    if keep && avail_phys.is_some_and(|avail| avail >= keep_bar) {
         return KEPT_MS;
     }
     const NORMAL_MS: u64 = 10_000;
@@ -383,9 +426,9 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
-    if avail < 2 * GIB {
+    if avail < if tight { 4 * GIB } else { 2 * GIB } {
         HIGH_MS
-    } else if avail < 4 * GIB {
+    } else if avail < if tight { 8 * GIB } else { 4 * GIB } {
         MODERATE_MS
     } else {
         NORMAL_MS
@@ -432,11 +475,25 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    let avail = avail_phys_ram();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::list::trim_idle(avail);
+    send::trim_spare(avail);
+    trim_spare_chunks(avail);
+}
+
+/// Available physical RAM right now, in bytes.
+fn avail_phys_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain struct filled by GlobalMemoryStatusEx with dwLength initialized.
+    let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    st.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: valid pointer and initialized dwLength.
+    (unsafe { GlobalMemoryStatusEx(&mut st) } != 0).then_some(st.ullAvailPhys)
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -919,11 +976,26 @@ fn create() -> windows::core::Result<Host> {
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
         {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
-            // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            let nvidia = crate::indirect::nvidia(&device);
+            let rdna = amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64;
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                amd,
+                nvidia,
+                rdna,
+                "host wave lanes and shader profile"
+            );
+            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            if nvidia {
+                // Hardware-verified fast float (MAX_MIN | LEGACY | MED3, FRACT off) +
+                // 128-bit WIDE raw buffer loads (LDG.E.128) on NVIDIA.
+                victory_shader::emit::set_host_nvidia(true);
+            } else {
+                // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
+                victory_shader::emit::set_host_rdna(rdna);
+            }
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -1913,9 +1985,10 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = if keep_freed() && !tight_ram() { SPARE_KEPT } else { SPARE_MOST };
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, cap)
             } else {
                 Some(chunk)
             };
@@ -1933,6 +2006,33 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         }
     }
     // Freed outside the lock.
+    drop(freed);
+}
+
+/// Releases spare upload scratch chunks when physical RAM runs low (< 6 GiB free).
+fn trim_spare_chunks(avail_phys: Option<u64>) {
+    let Some(avail) = avail_phys else { return };
+    const GIB: u64 = 1 << 30;
+    let target = if avail < 3 * GIB {
+        32 << 20
+    } else if avail < 6 * GIB {
+        64 << 20
+    } else {
+        return;
+    };
+    let mut freed = Vec::new();
+    {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > target {
+            let Some((chunk, size)) = spare.kept.pop() else { break };
+            spare.bytes -= size;
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            freed.push(chunk);
+        }
+    }
     drop(freed);
 }
 
@@ -2043,10 +2143,23 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
+    // 2-barrier 8x8 parallel reduction (14 serial steps vs 63, only 2 barriers total):
+    // avoids the 6-barrier occupancy tax on 2-warp NVIDIA groups while cutting tail latency 4.5x.
+    if (thread < 8u) {
+        uint base = thread * 8u;
+        uint4 acc = parts[base];
+        [unroll]
+        for (uint j = 1u; j < 8u; ++j) {
+            acc = (acc ^ parts[base + j]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            acc = acc.yzwx ^ (acc >> 15);
+        }
+        parts[thread] = acc;
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (thread != 0u) return;
     h = parts[0];
-    [loop]
-    for (uint i = 1u; i < 64u; ++i) {
+    [unroll]
+    for (uint i = 1u; i < 8u; ++i) {
         h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
@@ -10335,10 +10448,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        let ram_idle_ms = |avail| super::ram_idle_for(avail, false);
-        assert_eq!(super::ram_idle_for(Some(12 << 30), true), 300_000);
-        assert_eq!(super::ram_idle_for(Some((12 << 30) - 1), true), 10_000);
-        assert_eq!(super::ram_idle_for(None, true), 10_000);
+        let ram_idle_ms = |avail| super::ram_idle_for(avail, false, false);
+        assert_eq!(super::ram_idle_for(Some(12 << 30), true, false), 300_000);
+        assert_eq!(super::ram_idle_for(Some((12 << 30) - 1), true, false), 10_000);
+        assert_eq!(super::ram_idle_for(None, true, false), 10_000);
         let gib = 1024 * 1024 * 1024;
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
@@ -10351,6 +10464,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+        // Tight RAM (<= 36 GiB): stricter thresholds
+        assert_eq!(super::ram_idle_for(Some(16 * gib), true, true), 300_000);
+        assert_eq!(super::ram_idle_for(Some(12 * gib), true, true), 10_000);
+        assert_eq!(super::ram_idle_for(Some(6 * gib), false, true), 5_000);
+        assert_eq!(super::ram_idle_for(Some(3 * gib), false, true), 2_000);
     }
 }
 

@@ -225,14 +225,56 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
-/// The most host lists kept idle (128 were too few: flights land several at
-/// a time, so lists were thrown away and others made in the same frame, with
-/// their preludes and buffers, 12 % of the submitting thread in the opening,
-/// profile cpu-1), and the most upload memory they may keep
-/// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// The most host lists kept idle (`VICTORY_LIST_POOL_MAX`), and the most upload
+/// memory they may keep between them (a list keeps scratch chunks over a reset
+/// only while lists do not share them, `VICTORY_SCRATCH_POOL=0`).
+///
+/// Each idle list retains two D3D12 command allocators whose backing memory
+/// drivers do not shrink on Reset (~9 GB across 512 lists in long sessions).
+/// On hosts with <= 36 GiB physical RAM we default to 128 idle lists to avoid
+/// pagefile thrashing while keeping 512 on 64 GiB+ hosts.
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let count = std::env::var("VICTORY_LIST_POOL_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| if crate::host::tight_ram() { 128 } else { 512 })
+            .clamp(16, 2048);
+        tracing::info!(idle_lists = count, "host command list pool limit (VICTORY_LIST_POOL_MAX)");
+        (count, 256 << 20)
+    })
+}
+
+/// Trims oldest idle host lists (whose D3D12 command allocators never shrink on
+/// Reset) when free physical RAM drops below 6 GiB.
+#[cfg(windows)]
+pub(crate) fn trim_idle(avail_phys: Option<u64>) {
+    let Some(avail) = avail_phys else { return };
+    const GIB: u64 = 1 << 30;
+    let target = if avail < 3 * GIB {
+        16
+    } else if avail < 6 * GIB {
+        32
+    } else {
+        return;
+    };
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let (list, bytes) = &mut *idle;
+        if list.len() > target {
+            let excess = list.len() - target;
+            // Evict from the front (oldest/coldest lists whose allocators grew earlier).
+            for item in list.drain(0..excess) {
+                *bytes = bytes.saturating_sub(item.1);
+                dropped.push(item);
+            }
+        }
+    }
+    drop(dropped);
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -273,7 +315,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let most = idle_most();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -281,7 +324,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most.0 && idle.1 + bytes <= most.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

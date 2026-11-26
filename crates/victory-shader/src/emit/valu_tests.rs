@@ -2057,3 +2057,147 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         }
     }
 }
+
+/// Whether the hardware adapter is an NVIDIA GPU (`VendorId == 0x10de`).
+fn nvidia_card() -> bool {
+    use windows::Win32::Graphics::Dxgi::*;
+    let Ok(host) = Host::new(false) else { return false };
+    // SAFETY: plain DXGI adapter query.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x10de)
+    }
+}
+
+/// The forms written for NVIDIA hardware ([`super::rdna::NVIDIA`]:
+/// `MAX_MIN | LEGACY | MED3`, keeping `FRACT` safe) match the spelled-out
+/// reference bit-for-bit on NVIDIA GPUs; a legacy product's zero may have
+/// the other sign.
+#[test]
+fn nvidia_forms_give_what_the_spelled_out_ones_give() {
+    if !nvidia_card() {
+        eprintln!("no NVIDIA card; skipped");
+        return;
+    }
+    const ONE: u16 = 242;
+    const MINUS_ONE: u16 = 243;
+    let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
+    let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
+    let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
+    let bodies: [(&str, Vec<u32>, bool); 13] = [
+        ("max", vop3(0x110, 0, a, b, 0).to_vec(), true),
+        ("min", vop3(0x10F, 0, a, b, 0).to_vec(), true),
+        ("max3", vop3(0x154, 0, a, b, c).to_vec(), true),
+        ("min3", vop3(0x151, 0, a, b, c).to_vec(), true),
+        ("med3 0 1", vop3(0x157, 0, a, 128, ONE).to_vec(), true),
+        ("med3 1 0", vop3(0x157, 0, ONE, a, 128).to_vec(), true),
+        ("med3 1 -1", vop3(0x157, 0, ONE, MINUS_ONE, a).to_vec(), true),
+        ("mul_legacy", vop3(0x107, 0, a, b, 0).to_vec(), false),
+        ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
+        ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
+        ("mul_legacy of a saturated", two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
+        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
+        ("max of a mul_legacy", two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
+    ];
+    let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, -1e-20, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let mut cases = Vec::new();
+    for (i, x) in numbers.iter().enumerate() {
+        for (j, y) in numbers.iter().enumerate() {
+            let z = numbers[(3 * i + j) % numbers.len()];
+            cases.push([x.to_bits(), y.to_bits(), z.to_bits(), 0]);
+        }
+    }
+    for (name, body, exact) in bodies {
+        let mut got: Vec<Vec<u32>> = Vec::new();
+        let mut written = Vec::new();
+        for bits in [0, super::rdna::NVIDIA] {
+            lower::TEST_RDNA.set(Some(bits));
+            let shader = build_valu_cs(&body);
+            lower::TEST_RDNA.set(None);
+            written.push(shader.dxil.clone());
+            let mut all = Vec::new();
+            run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, _, r| all.push(r));
+            got.push(all);
+        }
+        assert_ne!(written[0], written[1], "{name}: written alike");
+        for (case, (&was, &is)) in cases.iter().zip(got[0].iter().zip(&got[1])) {
+            let (x, y) = (f32::from_bits(was), f32::from_bits(is));
+            let same = was == is || x.is_nan() && y.is_nan() || !exact && x == 0.0 && y == 0.0;
+            assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
+        }
+    }
+}
+
+/// Probes each fast-float lowering bit (`rdna::MAX_MIN`, `LEGACY`, `MED3`, `FRACT`)
+/// on the host GPU (including NVIDIA Ada) against the spelled-out reference.
+#[test]
+#[ignore = "hardware capability probe"]
+fn probe_host_fast_float_bits() {
+    const ONE: u16 = 242;
+    const MINUS_ONE: u16 = 243;
+    let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
+    let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
+    let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
+    let bodies: [(&str, u32, Vec<u32>, bool); 14] = [
+        ("max", super::rdna::MAX_MIN, vop3(0x110, 0, a, b, 0).to_vec(), true),
+        ("min", super::rdna::MAX_MIN, vop3(0x10F, 0, a, b, 0).to_vec(), true),
+        ("max3", super::rdna::MAX_MIN, vop3(0x154, 0, a, b, c).to_vec(), true),
+        ("min3", super::rdna::MAX_MIN, vop3(0x151, 0, a, b, c).to_vec(), true),
+        ("med3 0 1", super::rdna::MED3, vop3(0x157, 0, a, 128, ONE).to_vec(), true),
+        ("med3 1 0", super::rdna::MED3, vop3(0x157, 0, ONE, a, 128).to_vec(), true),
+        ("med3 1 -1", super::rdna::MED3, vop3(0x157, 0, ONE, MINUS_ONE, a).to_vec(), true),
+        ("fract", super::rdna::FRACT, vec![vop1(0x020, 0, a)], true),
+        ("mul_legacy", super::rdna::LEGACY, vop3(0x107, 0, a, b, 0).to_vec(), false),
+        ("mul_legacy by itself", super::rdna::LEGACY, vop3(0x107, 0, a, a, 0).to_vec(), false),
+        ("mul_legacy by a constant", super::rdna::LEGACY, vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
+        ("mul_legacy of a saturated", super::rdna::LEGACY, two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
+        ("mad_legacy", super::rdna::LEGACY, vop3(0x140, 0, a, b, c).to_vec(), false),
+        ("max of a mul_legacy", super::rdna::LEGACY | super::rdna::MAX_MIN, two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
+    ];
+    let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, -1e-20, -1e-38, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let mut cases = Vec::new();
+    for (i, x) in numbers.iter().enumerate() {
+        for (j, y) in numbers.iter().enumerate() {
+            let z = numbers[(3 * i + j) % numbers.len()];
+            cases.push([x.to_bits(), y.to_bits(), z.to_bits(), 0]);
+        }
+    }
+    for (name, bit, body, exact) in bodies {
+        let mut got: Vec<Vec<u32>> = Vec::new();
+        let mut sizes = Vec::new();
+        for bits in [0, bit] {
+            lower::TEST_RDNA.set(Some(bits));
+            let shader = build_valu_cs(&body);
+            lower::TEST_RDNA.set(None);
+            sizes.push(shader.dxil.len());
+            let mut all = Vec::new();
+            run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, _, r| all.push(r));
+            got.push(all);
+        }
+        let mut exact_mismatches = 0usize;
+        let mut signed_zero_only = 0usize;
+        let mut first_diff = String::new();
+        for (case, (&was, &is)) in cases.iter().zip(got[0].iter().zip(&got[1])) {
+            let (x, y) = (f32::from_bits(was), f32::from_bits(is));
+            let same_strict = was == is || (x.is_nan() && y.is_nan());
+            let same_zero = x == 0.0 && y == 0.0;
+            if !same_strict {
+                if same_zero {
+                    signed_zero_only += 1;
+                }
+                if !(!exact && same_zero) {
+                    exact_mismatches += 1;
+                    if first_diff.is_empty() {
+                        first_diff = format!("in={:?} ref={x}({was:#x}) fast={y}({is:#x})", case.map(f32::from_bits));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "FLOAT PROBE {name:<28} bit={bit:#x} dxil={}->{}B  mismatches={exact_mismatches} (signed_zero={signed_zero_only}) {first_diff}",
+            sizes[0], sizes[1]
+        );
+    }
+}

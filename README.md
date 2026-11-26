@@ -1,117 +1,66 @@
-# VIctory on an RX 7900 XTX
+# Victory-4090 (VIctory for NVIDIA RTX 4090 / Ada Lovelace)
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (originally forked from [Marvisak/VIctory](https://github.com/Marvisak/VIctory) and [fxceless/victory-fork](https://github.com/fxceless/victory-fork)), engineered to port, verify, and surpass its AMD RDNA 3 optimizations on **NVIDIA Ada Lovelace (RTX 4090 / 4090 D, SM 8.9, 24 GB VRAM, Resizable BAR)** — including dedicated memory optimizations for **32 GB system RAM** hosts.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+**This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated with or endorsed by the game's developer or publisher.
 
-## Where it stands (2026-11-25)
+## Key NVIDIA RTX 4090 & 32 GB RAM Enhancements
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+Full hardware probes, A/B microbenchmarks, and architectural rationale are in [docs/findings-4090.md](docs/findings-4090.md) (upstream RDNA 3 notes kept in [docs/findings.md](docs/findings.md)).
 
-| | |
-|---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+### GPU & Shader Optimizations
+- **Hardware-verified NVIDIA Fast Float Lowering (`rdna::NVIDIA = MAX_MIN | LEGACY | MED3`)**: Empirically verified bit-for-bit across 144 float edge cases on RTX 4090 D; unlocks fast hardware `FMNMX` / `med3` / `legacy_mul` while keeping `FRACT` safely spelled out (NVIDIA `Frc(-1e-20)` returns `1.0`).
+- **Vectorized 128-bit Raw Buffer Loads (`WIDE` / `LDG.E.128`)**: Automatically enabled on NVIDIA hosts (unlike AMD's scalar load unit, NVIDIA benefits from wider 128-bit vector loads and smaller DXIL IR).
+- **Wide Indirect Compute Dispatches (`> 65,535` groups, up to `1 << 20`)**: Unlocked for NVIDIA (`0x10de`) after hardware verification on RTX 4090 D (`67,440`..`1,048,576` groups, 0 missed groups) — fixes 1440p/4K bottom-screen tile truncation.
+- **2-Stage 8x8 Parallel Reduction in `CARD_COMPARE` (+ matching CPU `torn::finish`)**: Replaces the 63-step serial tail loop in thread 0 with a 2-barrier 8x8 parallel reduction (+4.2%–7.7% faster small/mid batches, **2,269 GB/s** in 4090 L2, **886 GB/s** in GDDR6X).
+- **Resizable BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) Window Offloading**: Measured **76.3 GB/s CPU write** and **453.4 GB/s GPU read (4.32x faster than system RAM `UPLOAD`)** on RTX 4090 D; auto-offloads up to 2 GiB of read-only windows directly into 4090 VRAM on 32 GB RAM hosts.
+- **64-bit Word Bitset Dynamic Descriptor Allocator (`DynamicBits`)**: 64x denser hardware-accelerated (`trailing_zeros`/`trailing_ones`) slot search under lock, plus `VICTORY_DYNAMIC_SLOTS` support on NVIDIA's strict 1,000,000-view shader-visible heap.
+- **NVIDIA Warp32 Barrier Safety (`VICTORY_GROUP_SYNC=1`)**: Prevents NVIDIA TDR hangs caused by divergent `s_barrier` calls while preserving memory fences and uniform barriers.
 
-It started at 280 ms a frame in the same scenes two days earlier.
+### 32 GB System RAM Profile (Auto-detected on `<= 36 GiB` RAM, `VICTORY_LOW_RAM=0/1`)
+- Caps idle D3D12 command list allocators to `128` (down from `512` / ~9 GB) and actively trims oldest allocators down to `32`/`16` when free RAM drops below `6`/`3 GiB`.
+- Moves 2 GiB of read-only windows into 4090 VRAM via ReBAR and tightens remaining system-RAM windows to a 1 MiB grid (`VICTORY_WINDOW_KB=1024`).
+- Tightens scratch (`128 MiB`), send (`192 MiB`), and snapshot (`192 MiB`) pools with low-RAM sweep trimming.
+- Caps NVIDIA pipeline compiler workers to `8` (down from `16`) to avoid multi-GB NVVM compile spikes during world loading.
 
-What is known to be wrong:
+## How to Build & Run
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
-
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+Requirements: Windows 10/11 x64, AVX2 CPU, NVIDIA RTX GPU (SM 6.6 + Mesh Shaders + Resizable BAR recommended), Rust (pinned toolchain), MSVC build tools, and your own copy of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
+copy victory.example.toml victory.toml      # set paths OUTSIDE this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+Useful `scripts\play.ps1` flags:
+- `-Safe`: disables newest aggressive async/ReBAR paths for troubleshooting.
+- `-RayTracing`: enables the title's ray-traced indirect lighting (`VICTORY_BVH_BUILDER=1`).
+- `-LowRam`: forces the 32 GB RAM profile explicitly (already auto-detected on `<= 36 GiB` RAM hosts).
+- `-Awake`: enables the async-compute clock keep-awake thread (off by default on NVIDIA).
 
-Before the first run, ahead of time (both can be stopped and go on later):
+Pre-translating shaders and warming pipelines ahead of a run:
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+target\diag\victory.exe shaders <path-to-shaders.rpf>
+target\diag\victory.exe warm --used
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+Running the RTX 4090 hardware verification & benchmark suite:
 
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+```powershell
+cargo test --locked -p victory-shader --lib -- nvidia_forms_give_what_the_spelled_out_ones_give emit::wave64_tests::
+cargo test --locked --release -p victory-gpu --lib -- card_runs_wide_indirect_dispatches dynamic_bits_tracks_runs_across_word_boundaries ram_idle_ms_scales_with_pressure
+cargo test --locked --release -p victory-gpu --lib -- nvidia_ada_hardware_probe card_compare_costs indirect::bench --ignored --nocapture
+```
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+This fork builds directly on the community's work, keeping full git history and commit attribution:
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: the upstream fork this NVIDIA Ada / RTX 4090 fork builds upon.
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**: the original loader, runtime services, D3D12 backend, and shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[DexNom/VIctory](https://github.com/DexNom/VIctory)**, **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**, **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**, **[myokex/victory-amd](https://github.com/myokex/victory-amd)**, **Geckomacabre**, **cxy0072019-sketch**, and **[XCL](https://github.com/ivall/xcl)** (reference only).
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
-
-ZETTROX
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE) and [docs/asset-policy.md](docs/asset-policy.md).

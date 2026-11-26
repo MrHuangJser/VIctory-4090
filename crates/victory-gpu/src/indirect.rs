@@ -272,25 +272,36 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// them are classes of the picture's 8x4 tiles, 115,200 in all at
 /// 2560x1440: in a captured frame 67,440 and 47,760 (the program
 /// 2dc364df5d3278b8 and 940c2635dc1312f4). Cut to 65,535 the first list lost
-/// its last 1,905 tiles, the lowest of the picture. The console runs what it
-/// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
-/// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
-fn widest(amd: bool) -> u32 {
+/// its last 1,905 tiles, the lowest of the picture. Both AMD RDNA and NVIDIA
+/// (verified up to 1<<20 on RTX 4090 D, Ada SM 8.9: hardware gridDim.x is
+/// 2^31-1 and D3D12 does not clamp indirect counts) run all groups natively.
+/// Other cards stay at 65,535.
+fn widest(wide_capable: bool) -> u32 {
     let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+    if wide_capable && on { 1 << 20 } else { 65_535 }
 }
 
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
+/// The PCI vendor ID of `device`'s adapter, or `None` if unavailable.
+pub(crate) fn vendor_id(device: &ID3D12Device) -> Option<u32> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
             .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+            .ok()
+            .map(|d| d.VendorId)
     }
+}
+
+/// Whether `device` is an AMD card's.
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    vendor_id(device) == Some(0x1002)
+}
+
+/// Whether `device` is an NVIDIA card's.
+pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
+    vendor_id(device) == Some(0x10de)
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
@@ -308,7 +319,8 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let wide = amd(device) || nvidia(device);
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(wide), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2981,7 +2993,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !amd(&gpu.device) || widest(true) == 65_535 {
+        if !(amd(&gpu.device) || nvidia(&gpu.device)) || widest(true) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
@@ -3025,6 +3037,159 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 assert_eq!([word(0), word(1), word(2)], [runs, runs - 1, runs - 1], "asked for {asked}, batched {batched}");
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "hardware capability probe for NVIDIA Ada / RTX 4090"]
+    fn nvidia_ada_hardware_probe() {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            eprintln!("no hardware D3D12 device");
+            return;
+        };
+        unsafe {
+            let desc = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(gpu.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+                .unwrap();
+            let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+            eprintln!("ADAPTER: {name} vendor={:#x} device={:#x} vram={} MB", desc.VendorId, desc.DeviceId, desc.DedicatedVideoMemory >> 20);
+
+            let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            let _ = gpu.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o0).cast(), size_of_val(&o0) as u32);
+            let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let _ = gpu.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32);
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let _ = gpu.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32);
+            eprintln!(
+                "FEATURES: BindingTier={} WaveMin={} WaveMax={} WaveOps={} GPUUploadHeap(ReBAR)={}",
+                o0.ResourceBindingTier.0,
+                o1.WaveLaneCountMin,
+                o1.WaveLaneCountMax,
+                o1.WaveOps.as_bool(),
+                o16.GPUUploadHeapSupported.as_bool(),
+            );
+
+            for count in [1_000_000u32, 1_048_576, 1_500_000, 2_097_152, 4_194_304] {
+                let ok = gpu.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: count,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                }).is_ok();
+                eprintln!("HEAP SHADER_VISIBLE {count}: {ok}");
+            }
+
+            // Probe direct ExecuteIndirect Dispatch(X > 65535, 1, 1) without clamping to 65535
+            const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+}
+"#;
+            let worker = compile_cs(&gpu.device, CS).expect("worker");
+            let sig = gpu.signature(2, 12);
+            for asked in [65_535u32, 67_440, 115_200, 262_144, 1 << 20] {
+                let (src, src_ptr, _) = gpu.shared_buffer(256);
+                let size = 16 + (4 << 20) + 16;
+                let seen = gpu.default_uav(size);
+                let (back, back_ptr, _) = gpu.shared_buffer(size);
+                for (w, word) in [asked, 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(w).write_volatile(word);
+                }
+                gpu.list.SetComputeRootSignature(&worker.root);
+                gpu.list.SetPipelineState(&worker.pso);
+                gpu.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+                gpu.list.ExecuteIndirect(&sig, 1, &src, 0, None, 0);
+                gpu.list.ResourceBarrier(&[uav_barrier()]);
+                gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+                gpu.submit_and_wait();
+                let word = |i: usize| back_ptr.cast::<u32>().add(i).read_volatile();
+                let (count, max_g, max_t) = (word(0), word(1), word(2));
+                let wrong = (0..count.min(asked) as usize).find(|&g| word(4 + g) != 1);
+                eprintln!("WIDE INDIRECT asked={asked}: ran={count} max_group={max_g} max_thread={max_t} wrong={wrong:?}");
+            }
+
+            // Benchmark GPU_UPLOAD (ReBAR) vs UPLOAD (system RAM) for 64 MB CPU write + GPU hash read
+            if o16.GPUUploadHeapSupported.as_bool() {
+                let bytes = 64u64 << 20;
+                let src_data = vec![0xA5u8; bytes as usize];
+                let dev = gpu.device.clone();
+                let make_buf = |heap_type: D3D12_HEAP_TYPE| -> (ID3D12Resource, *mut u8) {
+                    let mut res: Option<ID3D12Resource> = None;
+                    dev.CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: if heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD {
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                            } else {
+                                D3D12_RESOURCE_FLAG_NONE
+                            },
+                            ..Default::default()
+                        },
+                        if heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD {
+                            D3D12_RESOURCE_STATE_COMMON
+                        } else {
+                            D3D12_RESOURCE_STATE_GENERIC_READ
+                        },
+                        None,
+                        &mut res,
+                    ).unwrap();
+                    let res = res.unwrap();
+                    let mut ptr = std::ptr::null_mut();
+                    res.Map(0, None, Some(&mut ptr)).unwrap();
+                    (res, ptr.cast())
+                };
+                let compare = compile_cs(&gpu.device, crate::host::CARD_COMPARE).unwrap();
+                let hashes = gpu.default_uav(64 << 10);
+                let differs = gpu.default_uav(64 << 10);
+                for (label, ht) in [("UPLOAD(SysRAM)", D3D12_HEAP_TYPE_UPLOAD), ("GPU_UPLOAD(ReBAR)", D3D12_HEAP_TYPE_GPU_UPLOAD)] {
+                    let (buf, ptr) = make_buf(ht);
+                    // Warm up
+                    std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr, bytes as usize);
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..4 {
+                        std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr, bytes as usize);
+                    }
+                    let cpu_ms = t0.elapsed().as_secs_f64() * 1e3 / 4.0;
+                    // GPU read pass (8 rounds of 1024 pieces = 512 MB read)
+                    let t1 = std::time::Instant::now();
+                    gpu.list.SetComputeRootSignature(&compare.root);
+                    gpu.list.SetPipelineState(&compare.pso);
+                    gpu.list.SetComputeRootShaderResourceView(1, buf.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    let constants = [0u32, 0, bytes as u32, 1024, 0, 1];
+                    gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    for _ in 0..8 {
+                        gpu.list.Dispatch(1024, 1, 1);
+                    }
+                    gpu.submit_and_wait();
+                    let gpu_ms = t1.elapsed().as_secs_f64() * 1e3;
+                    eprintln!(
+                        "REBAR BENCH {label:<18}: CPU write 64MB = {cpu_ms:.2} ms ({:.1} GB/s), GPU read 512MB = {gpu_ms:.2} ms ({:.1} GB/s)",
+                        (64.0 / 1024.0) / (cpu_ms / 1e3),
+                        (512.0 / 1024.0) / (gpu_ms / 1e3),
+                    );
+                }
             }
         }
     }

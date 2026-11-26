@@ -251,7 +251,12 @@ pub fn run(
         victory_shader::emit::set_host_max_wave(n);
     }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
-    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
+    // `VICTORY_HOST_NVIDIA=1`: as for an NVIDIA card (MAX_MIN|LEGACY|MED3 + WIDE 128-bit loads).
+    if std::env::var_os("VICTORY_HOST_NVIDIA").is_some_and(|v| v == "1") {
+        victory_shader::emit::set_host_nvidia(true);
+    } else {
+        victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
+    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;

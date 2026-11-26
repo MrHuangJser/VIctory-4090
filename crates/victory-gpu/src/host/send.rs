@@ -119,8 +119,40 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
+/// Tighter on <= 36 GiB RAM systems (192 MiB instead of 768 MiB).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        256 << 20
+    } else if super::tight_ram() {
+        192 << 20
+    } else {
+        768 << 20
+    }
+}
+
+/// Drops excess spare send buffers when free physical RAM runs low (< 6 GiB).
+pub(super) fn trim_spare(avail_phys: Option<u64>) {
+    let Some(avail) = avail_phys else { return };
+    const GIB: u64 = 1 << 30;
+    let target = if avail < 3 * GIB {
+        32 << 20
+    } else if avail < 6 * GIB {
+        64 << 20
+    } else {
+        return;
+    };
+    let mut dropped = Vec::new();
+    {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.sort_by_key(|m| std::cmp::Reverse(m.size));
+        while spare.iter().map(|m| m.size).sum::<u64>() > target {
+            if spare.is_empty() {
+                break;
+            }
+            dropped.push(spare.remove(0));
+        }
+    }
+    drop(dropped);
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

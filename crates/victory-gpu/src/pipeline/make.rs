@@ -397,12 +397,23 @@ fn next(screens_only: bool) -> Arc<Pending> {
 }
 
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
-/// 64), else two thirds of the logical processors, 2 to 16. They run below the
-/// title's own threads, and a cold cache queues hundreds at once.
+/// 64), else two thirds of the logical processors, 2 to 16 (capped at 8 on
+/// NVIDIA + <= 36 GiB RAM systems, since each concurrent NVVM pipeline compile
+/// can use ~0.5–1.5 GiB of driver memory). They run below the title's own
+/// threads, and a cold cache queues hundreds at once.
 fn worker_count(asked: Option<usize>, processors: usize) -> usize {
+    let tight_nvidia = crate::host::tight_ram()
+        && crate::host::host().is_some_and(|h| crate::indirect::nvidia(&h.device));
+    worker_count_for(asked, processors, tight_nvidia)
+}
+
+fn worker_count_for(asked: Option<usize>, processors: usize, tight_nvidia: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
-        None => (processors * 2 / 3).clamp(2, 16),
+        None => {
+            let cap = if tight_nvidia { 8 } else { 16 };
+            (processors * 2 / 3).clamp(2, cap)
+        }
     }
 }
 
@@ -483,11 +494,12 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
+        assert_eq!(worker_count_for(None, 1, false), 2);
+        assert_eq!(worker_count_for(None, 24, false), 16);
+        assert_eq!(worker_count_for(None, 64, false), 16);
+        assert_eq!(worker_count_for(None, 24, true), 8);
+        assert_eq!(worker_count_for(Some(0), 24, true), 1);
+        assert_eq!(worker_count_for(Some(20), 24, true), 20);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

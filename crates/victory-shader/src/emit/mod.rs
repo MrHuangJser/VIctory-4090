@@ -118,7 +118,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use lower::{host_settings, set_host_max_wave, set_host_nvidia, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -223,24 +223,33 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// On a host whose shaders run on the console's own kind of hardware (AMD
-/// RDNA, [`set_host_rdna`]): which of the console's float instructions are
-/// written as the one host operation the driver makes the same instruction
-/// of, instead of spelled out in operations every host agrees on.
-/// `VICTORY_RDNA_FLOAT`: a set of [`rdna`]'s bits (decimal or `0x` hex); all
-/// of them when it is unset, `0` none. Nothing on other hosts.
+/// Whether `VICTORY_SHADER_OPT` was explicitly specified by the user.
+pub(crate) fn shader_opt_explicit() -> bool {
+    static EXPLICIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXPLICIT.get_or_init(|| std::env::var_os("VICTORY_SHADER_OPT").is_some())
+}
+
+/// On a host whose hardware shares float semantics with the console (AMD
+/// RDNA via [`set_host_rdna`], or NVIDIA Ada/Ampere via [`set_host_nvidia`]):
+/// which of the console's float instructions are written as the one host
+/// operation the driver compiles to the matching hardware instruction, instead
+/// of spelled out in operations every host agrees on.
+/// `VICTORY_RDNA_FLOAT` (or `VICTORY_FAST_FLOAT`): a set of [`rdna`]'s bits
+/// (decimal or `0x` hex); all host-verified bits when unset, `0` none.
 ///
-/// Measured on an RX 7900 XTX (a frame of the yard, replayed turn by turn with
-/// and without): the title's dispatches and draws 18.4 -> 17.6 ms, 0.4 of it
-/// without [`rdna::LEGACY`]. Tried and worth nothing there: `v_mad_f32` as one
-/// multiply-add, a fast reciprocal, scalar buffer loads of four dwords at once,
-/// a wave size for every compute program (32, 64, the console's).
+/// Verified bit-for-bit on NVIDIA GeForce RTX 4090 D (Ada Lovelace, SM 8.9):
+/// [`rdna::MAX_MIN`], [`rdna::LEGACY`], and [`rdna::MED3`] (`rdna::NVIDIA = 7`)
+/// pass 100% of edge cases (including `-0.0`/`+0.0` ordering and NaN skipping);
+/// [`rdna::FRACT`] returns `1.0` for tiny negative inputs (`-1e-20`) on NVIDIA
+/// and therefore stays disabled on NVIDIA.
 ///
 /// Part of the translation: the shader cache keys on it ([`host_settings`]).
 pub fn rdna_float() -> u32 {
     static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BITS.get_or_init(|| {
-        let value = std::env::var("VICTORY_RDNA_FLOAT").ok();
+        let value = std::env::var("VICTORY_RDNA_FLOAT")
+            .ok()
+            .or_else(|| std::env::var("VICTORY_FAST_FLOAT").ok());
         parse_set(value.as_deref(), rdna::ALL, rdna::ALL)
     })
 }
@@ -248,17 +257,20 @@ pub fn rdna_float() -> u32 {
 /// The bits of [`rdna_float`].
 pub mod rdna {
     /// `v_max_f32` and the like: the host's FMax and FMin, without the code
-    /// that orders -0 below +0.
+    /// that orders -0 below +0 (hardware-verified exact on AMD RDNA and NVIDIA Ada).
     pub const MAX_MIN: u32 = 1;
     /// `v_mul_legacy_f32` and the like (0 times anything is 0): a plain product
     /// where no factor can be an infinity or no number where the other is 0,
     /// and one comparison where it can. A zero may have the other sign.
     pub const LEGACY: u32 = 2;
     /// `v_med3_f32` of a value between two ordered constants: a minimum of a
-    /// maximum.
+    /// maximum (hardware-verified exact on AMD RDNA and NVIDIA Ada).
     pub const MED3: u32 = 4;
-    /// `v_fract_f32`: the host's Frc as it is.
+    /// `v_fract_f32`: the host's Frc as it is (AMD RDNA only; NVIDIA's Frc
+    /// rounds tiny negatives like -1e-20 to 1.0 instead of 0x3f7fffff).
     pub const FRACT: u32 = 8;
+    /// The bits hardware-verified on NVIDIA Ada (RTX 4090 D): MAX_MIN | LEGACY | MED3.
+    pub const NVIDIA: u32 = MAX_MIN | LEGACY | MED3;
     pub const ALL: u32 = 15;
 }
 
@@ -295,6 +307,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
+    out.push(u8::from(lower::host_wide_loads()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());

@@ -465,8 +465,16 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    let wave = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| if std::env::var_os("VICTORY_HOST_NVIDIA").is_some_and(|v| v == "1") { 32 } else { 64 });
+    victory_shader::emit::set_host_max_wave(wave);
+    if std::env::var_os("VICTORY_HOST_NVIDIA").is_some_and(|v| v == "1") {
+        victory_shader::emit::set_host_nvidia(true);
+    } else {
+        victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_none_or(|v| v != "0"));
+    }
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();

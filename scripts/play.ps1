@@ -1,27 +1,66 @@
-# Starts the title with the settings this fork is played with (README.md, "How to run it").
+# Starts the title with settings tuned for NVIDIA RTX 4090 (Ada Lovelace, 24 GB VRAM,
+# Resizable BAR) and 32 GB system RAM hosts (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Build        target\diag (the default, the build all measurements are of) or target\release
+# -RayTracing   the title's own ray-traced indirect light: lit interiors, heavier on the GPU
+# -LowRam       force the 32 GB RAM profile (auto-detected on <= 36 GB physical RAM hosts)
+# -Awake        enable async-compute clock keep-awake (off by default on NVIDIA)
+# -Build        target\diag (the default, with diagnostics) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$LowRam,
+    [switch]$Awake,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
 $settings = @{
-    VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
-    VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
-    VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    # Core async & GPU-side optimizations (ported from VIctory-7900XTX and verified on RTX 4090 D)
+    VICTORY_TEXTURE_NO_WAIT     = '1'
+    VICTORY_RELAY               = '2'
+    VICTORY_WIDE_BACK           = '1'
+    VICTORY_CARD_REHASH_RUNS    = '1'
+    VICTORY_JOIN_COPIES         = '1'
+    VICTORY_INDIRECT_WINDOW     = '1'
+    VICTORY_RELAY_COPY          = '1'
+    VICTORY_CARD_STEPS          = '2'
+    VICTORY_INDIRECT_BATCH      = '2'
+    VICTORY_INDIRECT_REST       = '0'
+    VICTORY_MAP_THREADS         = '1'
+    VICTORY_TITLE_PRIORITIES    = '0'
+    VICTORY_SHOW_AFTER          = '1'
+    VICTORY_AMBIENT             = '0.8'
+    VICTORY_D3D12_DRED          = 'light'
+    VICTORY_SKIP_PIPELINES      = 'none'
+    # NVIDIA Ada / RTX 4090 specific tuning:
+    # - Small buffers (>= 64 KiB) placed in 24 GB GDDR6X VRAM instead of crossing PCIe
+    # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (4.32x faster GPU reads, -2 GiB SysRAM)
+    # - Divergent s_barrier safety on NVIDIA Warp32 (prevents TDR hangs on non-uniform barriers)
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    VICTORY_WINDOWS_BAR_MB      = '2048'
+    VICTORY_GROUP_SYNC          = '1'
+}
+if ($Awake) {
+    $settings.VICTORY_CARD_AWAKE = '1'
+}
+if ($LowRam) {
+    $settings.VICTORY_LOW_RAM         = '1'
+    $settings.VICTORY_WINDOW_KB       = '1024'
+    $settings.VICTORY_WINDOW_TAILS    = '1'
+    $settings.VICTORY_LIST_POOL_MAX   = '128'
+    $settings.VICTORY_PIPELINE_WORKERS = '8'
 }
 if ($Safe) {
-    $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_UNDER_WIDE = '0'
+    $settings.VICTORY_LAND_ECHO  = '0'
+    $settings.VICTORY_WINDOWS_BAR_MB = '0'
 } else {
-    $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    $settings.VICTORY_THIN         = '1'
+    $settings.VICTORY_JOIN_PARTS   = '8'
+    $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

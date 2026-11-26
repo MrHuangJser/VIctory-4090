@@ -486,7 +486,28 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        if let Some(mb) = std::env::var("VICTORY_WINDOWS_BAR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            return mb << 20;
+        }
+        // Auto-enable 2048 MiB ReBAR window offload on NVIDIA GPUs with
+        // Resizable BAR (GPUUploadHeapSupported), >= 20 GiB VRAM, and <= 36 GiB
+        // system RAM: verified 4.32x faster GPU reads (453 vs 105 GB/s) and
+        // saves 2 GiB of system RAM. Set VICTORY_WINDOWS_BAR_MB=0 to disable.
+        let auto_mb = host().and_then(|h| {
+            let vram = h.video_memory().map(|[budget, ..]| budget).unwrap_or(0);
+            let auto = crate::indirect::nvidia(&h.device)
+                && h.mapped_card_memory()
+                && vram >= 20u64 << 30
+                && crate::host::tight_ram();
+            auto.then_some(2048u64)
+        }).unwrap_or(0);
+        if auto_mb > 0 {
+            tracing::info!(mb = auto_mb, "ReBAR GPU_UPLOAD windows auto-enabled (VICTORY_WINDOWS_BAR_MB=0: off)");
+        }
+        auto_mb << 20
     })
 }
 
@@ -1292,14 +1313,14 @@ fn snapshots_kept() -> usize {
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_bytes: usize = if crate::host::tight_ram() { 192 << 20 } else { 512 << 20 };
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_bytes {
             break;
         }
         kept += 1;
@@ -5047,7 +5068,10 @@ const WINDOW: u64 = 4 << 20;
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let kb = std::env::var("VICTORY_WINDOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or_else(|| crate::host::tight_ram().then_some(1024));
         grid(kb)
     })
 }
