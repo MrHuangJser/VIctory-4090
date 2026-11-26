@@ -7,6 +7,8 @@
 # -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB physical RAM hosts)
 # -SmallCardBuffers experimental: place small buffers (>= 64 KiB) in VRAM (VICTORY_CARD_BUFFERS_MIN_KB=64)
 # -Awake            enable async-compute clock keep-awake (off by default on NVIDIA)
+# -Console          console profile: 'series-x' (default) or 'series-s' (lighter, matches cool_fox 25+ FPS target)
+# -Pareto           high-FPS preset: Series S + LevelsOnDemand + SmallCardBuffers + Awake + release build
 # -Build            target\diag (the default, with diagnostics) or target\release
 # -More             other settings: -More @{VICTORY_PANEL='1'}
 # -Log              custom log file path (outside repo; default: ..\captures\victory-YYYYMMDD-HHMMSS.log)
@@ -20,11 +22,18 @@ param(
     [switch]$LowRam,
     [switch]$SmallCardBuffers,
     [switch]$Awake,
+    [switch]$Pareto,
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [string]$Log = '',
     [switch]$NoLog
 )
+if ($Pareto) {
+    if (-not $PSBoundParameters.ContainsKey('Console')) { $Console = 'series-s' }
+    if (-not $PSBoundParameters.ContainsKey('Build'))   { $Build = 'release' }
+    $Awake = $true
+}
 $settings = @{
     # Core async & GPU-side optimizations (ported from VIctory-7900XTX and verified on RTX 4090 D)
     VICTORY_TEXTURE_NO_WAIT     = '1'
@@ -45,19 +54,29 @@ $settings = @{
     VICTORY_SKIP_PIPELINES      = 'none'
     # NVIDIA Ada / RTX 4090 specific tuning:
     # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (4.32x faster GPU reads, -2 GiB SysRAM)
+    # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (saves 60-85s of stalls & 200-2000ms spikes)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
     #   and 100% match `victory.exe shaders` cache keys
     # - Enable Phase 1 DXR 1.1 RT Core bridge observer on DXR Tier 1.1 hosts
     # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32
     VICTORY_WINDOWS_BAR_MB      = '2048'
+    VICTORY_WAIT_RESIDENT       = '0'
     VICTORY_DXR                 = '1'
     VICTORY_FIRSTLANE_OWN       = '1'
+}
+if (-not $RayTracing) {
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
 }
 if ($SmallCardBuffers) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
 }
 if ($Awake) {
     $settings.VICTORY_CARD_AWAKE = '1'
+}
+if ($Pareto) {
+    $settings.VICTORY_LEVELS_ON_DEMAND = '1'
+    # Avoid PowerShell stdout pipe back-pressure from 18,000+ INFO lines (matches cool_fox Play-VIctory.cmd)
+    $settings.VICTORY_LOG              = 'warn'
 }
 if ($LowRam) {
     $settings.VICTORY_LOW_RAM         = '1'
@@ -70,6 +89,7 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'
     $settings.VICTORY_LAND_ECHO  = '0'
     $settings.VICTORY_WINDOWS_BAR_MB = '0'
+    $settings.VICTORY_WAIT_RESIDENT  = '1'
     $settings.VICTORY_DXR        = '0'
 } else {
     $settings.VICTORY_THIN         = '1'
@@ -103,7 +123,7 @@ if (-not $NoLog) {
     $prevEap = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $victory run $Exe --execute 2>&1 | ForEach-Object {
+        & $victory run $Exe --console $Console --execute 2>&1 | ForEach-Object {
             $line = "$_"
             Write-Host $line
             $writer.WriteLine($line)
@@ -114,5 +134,5 @@ if (-not $NoLog) {
         Pop-Location
     }
 } else {
-    try { & $victory run $Exe --execute } finally { Pop-Location }
+    try { & $victory run $Exe --console $Console --execute } finally { Pop-Location }
 }
