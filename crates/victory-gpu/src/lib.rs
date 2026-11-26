@@ -85,6 +85,8 @@ mod ab;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+mod telemetry;
+#[cfg(windows)]
 mod texture;
 pub mod timeline;
 #[cfg(windows)]

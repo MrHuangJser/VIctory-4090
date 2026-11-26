@@ -29,7 +29,7 @@
 //! [`crate::watch::landed_beside`] notes the blocks written afterwards, so
 //! that the next refresh takes them as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
@@ -52,7 +52,9 @@ fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
+        // Cap at 8 by default: 12 threads increased VirtualProtect/guard lock contention
+        // (`grd` 6-10ms -> 12-20ms) without beating 8T wall time.
+        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 3).clamp(2, 8))).clamp(1, 16)
     })
 }
 
@@ -200,6 +202,8 @@ struct Pool {
     state: Mutex<State>,
     more: Condvar,
     idle: Condvar,
+    /// Lock-free work index for the current batch (avoids per-item mutex bounces).
+    next: AtomicUsize,
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
@@ -208,8 +212,8 @@ struct Pool {
 struct State {
     /// What to do with each number below `count`.
     work: Option<Work>,
-    next: usize,
     count: usize,
+    generation: u64,
     /// Helpers inside a call.
     running: usize,
     panicked: bool,
@@ -229,9 +233,10 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            state: Mutex::new(State { work: None, count: 0, generation: 0, running: 0, panicked: false }),
             more: Condvar::new(),
             idle: Condvar::new(),
+            next: AtomicUsize::new(0),
             turn: Mutex::new(()),
             threads,
         }));
@@ -250,17 +255,28 @@ impl Pool {
     }
 
     fn help(&self) {
+        let mut seen = 0u64;
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            while state.generation == seen || state.work.is_none() {
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
-            };
+            }
+            let work = state.work.expect("checked above");
+            let count = state.count;
+            seen = state.generation;
             state.running += 1;
             drop(state);
             let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    let i = self.next.fetch_add(1, Ordering::Relaxed);
+                    if i >= count {
+                        break;
+                    }
+                    unsafe { (*work.0)(i) };
+                }
+            }));
             working.end();
             state = self.state();
             state.running -= 1;
@@ -283,17 +299,24 @@ impl Pool {
         // SAFETY: the lifetime is left out only until this call returns, and
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
+        self.next.store(0, Ordering::Relaxed);
         let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        state.work = Some(work);
+        state.count = count;
+        state.generation = state.generation.wrapping_add(1);
+        state.panicked = false;
         drop(state);
-        if count > self.threads {
+        if count >= self.threads {
             self.more.notify_all();
         } else {
             (1..count).for_each(|_| self.more.notify_one());
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
                 f(i);
             }
         }));
@@ -312,16 +335,6 @@ impl Pool {
     }
 }
 
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
-    let work = state.work?;
-    if state.next >= state.count {
-        return None;
-    }
-    state.next += 1;
-    Some((work, state.next - 1))
-}
-
 /// [`Pool::each`] on the threads kept for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
@@ -329,26 +342,32 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+/// (`VICTORY_UNDER_THREADS`, scales with cores up to 8 with this one).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        let default = std::thread::available_parallelism().map_or(6, |n| (n.get() / 3).clamp(6, 8));
+        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
-/// bytes, are others than those for the views picked by index: submissions
-/// wait for the first, lists for the second, and each kept the other waiting.
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, scales with cores up to
+/// 8 for views and 10 for records; 1: on this one alone). Those for `records`,
+/// the heaps' records copied as bytes, are others than those for the views
+/// picked by index: submissions wait for the first, lists for the second, and
+/// each kept the other waiting.
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let default = std::thread::available_parallelism().map_or(
+                if records { 6usize } else { 4 },
+                |n| if records { (n.get() / 3).clamp(6, 10) } else { (n.get() / 3).clamp(4, 8) },
+            );
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);

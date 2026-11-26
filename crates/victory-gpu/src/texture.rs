@@ -1334,14 +1334,21 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() && !exact {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+        let _mapped = if no_wait() {
+            // Not waited for: while the runtime remaps unrelated title memory,
+            // read through the kernel instead. Even for `exact` (bake) passes,
+            // a complete kernel read (`read_into`) yields exact bytes with zero
+            // lock wait; only if this texture's own pages are mid-remap do we
+            // fall back to waiting on the global remap lock.
+            if let Some(mapped) = crate::watch::title_memory_reading_now() {
+                mapped
+            } else if !exact {
                 return self.refresh_unlocked(last, size);
-            };
-            mapped
+            } else if let Some(read) = self.refresh_unlocked_exact(last, size) {
+                return read;
+            } else {
+                waited(2, crate::watch::title_memory_reading)
+            }
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1444,6 +1451,48 @@ impl Staging {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
             0
+        }
+    }
+
+    /// Lock-free exact refresh while the runtime is remapping unrelated title
+    /// memory: first tries reading all `size` bytes through the kernel
+    /// (`read_into`). If the texture is partially mapped (e.g. streamed-out
+    /// higher mips during a scene cut), reads the mapped pages lock-free via
+    /// `read_there` and succeeds whenever all currently-mapped bytes were
+    /// captured cleanly. Only returns `None` (falling back to the global remap
+    /// lock) if a mapped page actually vanished mid-read.
+    fn refresh_unlocked_exact(&self, last: &mut Last, size: usize) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ok = with_read(size, |read| {
+            if crate::host::read_into(self.memory, read) {
+                let hash = digest(read);
+                if last.hash != Some(hash) {
+                    last.hash = Some(hash);
+                    self.detile(read);
+                }
+                return true;
+            }
+            // Partially mapped texture: read all mapped pages through the kernel
+            // without stalling behind unrelated remaps on other virtual ranges.
+            let got = crate::host::read_there(self.memory, read) as u64;
+            let there = mapped_bytes(self.memory, size);
+            if got < there {
+                return false;
+            }
+            if got != 0 {
+                let hash = digest(read);
+                if last.hash != Some(hash) {
+                    last.hash = Some(hash);
+                    self.detile(read);
+                }
+            }
+            true
+        });
+        if ok {
+            UNLOCKED[0].fetch_add(1, Relaxed);
+            Some(size)
+        } else {
+            None
         }
     }
 

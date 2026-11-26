@@ -60,21 +60,23 @@ $settings = @{
     VICTORY_CARD_AWAKE          = '1'
     VICTORY_SKIP_PIPELINES      = 'none'
     # NVIDIA Ada / RTX 4090 specific tuning:
-    # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (keeps free RAM > 3 GiB so textures stay sharp!)
+    # - 3 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (keeps free RAM > 3 GiB so textures stay sharp!)
     # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (eliminates 60-85s stalls)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
     # - Enable DXR 1.1 RT Core bridge on DXR Tier 1.1 hosts
     # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32
-    VICTORY_WINDOWS_BAR_MB      = '2048'
+    VICTORY_WINDOWS_BAR_MB      = '3072'
     VICTORY_WAIT_RESIDENT       = '0'
     VICTORY_DXR                 = '1'
     VICTORY_FIRSTLANE_OWN       = '1'
+    # Keep wide workers non-spinning by default so 12 thin-list + game threads never lose cores
+    VICTORY_WIDE_SPIN           = '0'
 }
 if ($Diag) {
     $settings.VICTORY_D3D12_DRED = 'light'
 } else {
-    # Keep stdout lean to prevent PowerShell pipe back-pressure
-    $settings.VICTORY_LOG = 'warn'
+    # Keep stdout lean (no per-resource/pipeline spam) while preserving 5s FPS/CPU/GPU/RAM/DXR + bake summaries
+    $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::land=info,victory_gpu::queue::behind=info,victory_gpu::dxr=info,victory_gpu::telemetry=info,victory_gpu::draw=info'
 }
 if (-not $RayTracing) {
     $settings.VICTORY_AMBIENT_AIR = '1.5'
@@ -95,6 +97,7 @@ if ($Safe) {
     $settings.VICTORY_WINDOWS_BAR_MB = '0'
     $settings.VICTORY_WAIT_RESIDENT  = '1'
     $settings.VICTORY_DXR            = '0'
+    $settings.VICTORY_WIDE_SPIN      = '0'
 } else {
     $settings.VICTORY_THIN         = '1'
     $settings.VICTORY_JOIN_PARTS   = '8'

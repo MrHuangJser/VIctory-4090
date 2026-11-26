@@ -498,17 +498,18 @@ fn window_mapped_most() -> u64 {
         {
             return mb << 20;
         }
-        // Auto-enable 2048 MiB ReBAR window offload on NVIDIA GPUs with
+        // Auto-enable 3072 MiB ReBAR window offload on NVIDIA GPUs with
         // Resizable BAR (GPUUploadHeapSupported), >= 20 GiB VRAM, and <= 36 GiB
         // system RAM: verified 4.32x faster GPU reads (453 vs 105 GB/s) and
-        // saves 2 GiB of system RAM. Set VICTORY_WINDOWS_BAR_MB=0 to disable.
+        // shifts ~3 GiB of loose windows out of shared system RAM into VRAM.
+        // Set VICTORY_WINDOWS_BAR_MB=0 to disable.
         let auto_mb = host().and_then(|h| {
             let vram = h.video_memory().map(|[budget, ..]| budget).unwrap_or(0);
             let auto = crate::indirect::nvidia(&h.device)
                 && h.mapped_card_memory()
                 && vram >= 20u64 << 30
                 && crate::host::tight_ram();
-            auto.then_some(2048u64)
+            auto.then_some(3072u64)
         }).unwrap_or(0);
         if auto_mb > 0 {
             tracing::info!(mb = auto_mb, "ReBAR GPU_UPLOAD windows auto-enabled (VICTORY_WINDOWS_BAR_MB=0: off)");
@@ -528,10 +529,15 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    if let Some([budget, used, ..]) = host.video_memory() {
+        // On >= 20 GiB VRAM cards (e.g. 24 GiB RTX 4090), allow ReBAR windows
+        // up to 88% of budget (~2.7 GiB headroom, still under resource::room's
+        // 90% ceiling) so windows keep offloading out of 32 GiB host RAM even
+        // after world textures fill local VRAM past 80%.
+        let cap_pct = if budget >= 20u64 << 30 { 88 } else { 80 };
+        if used + size > budget / 100 * cap_pct {
+            return None;
+        }
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -564,10 +570,15 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    if let Some([budget, used, ..]) = host.video_memory() {
+        // On >= 20 GiB VRAM cards (e.g. 24 GiB RTX 4090), allow ReBAR windows
+        // up to 88% of budget (~2.7 GiB headroom, still under resource::room's
+        // 90% ceiling) so windows keep offloading out of 32 GiB host RAM even
+        // after world textures fill local VRAM past 80%.
+        let cap_pct = if budget >= 20u64 << 30 { 88 } else { 80 };
+        if used + size > budget / 100 * cap_pct {
+            return None;
+        }
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -1509,9 +1520,16 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, scales up to 12 on high-core CPUs).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 12)))
+            .clamp(1, 16)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -1561,18 +1579,28 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    struct Done {
+        remaining: std::sync::atomic::AtomicUsize,
+        lock: Mutex<bool>,
+        cond: std::sync::Condvar,
+    }
+    let done = Arc::new(Done {
+        remaining: std::sync::atomic::AtomicUsize::new(jobs.len()),
+        lock: Mutex::new(false),
+        cond: std::sync::Condvar::new(),
+    });
+    let count = jobs.len();
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        workers.there.fetch_add(count, Ordering::AcqRel);
         for job in jobs {
-            let left = left.clone();
-            workers.there.fetch_add(1, Ordering::AcqRel);
+            let done = done.clone();
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if done.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let mut finished = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+                    *finished = true;
+                    done.cond.notify_one();
                 }
             }));
         }
@@ -1588,10 +1616,16 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    if done.remaining.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    spin(|| done.remaining.load(Ordering::Acquire) == 0);
+    if done.remaining.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut finished = done.lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*finished && done.remaining.load(Ordering::Acquire) > 0 {
+        finished = done.cond.wait(finished).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -1605,6 +1639,13 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        work(0);
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
