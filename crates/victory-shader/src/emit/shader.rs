@@ -95,6 +95,9 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
+/// Root SRV `t<SLOT_TLAS>` in [`ROOT_CBV_SPACE`] for a native DXR 1.1
+/// `RaytracingAccelerationStructure` (`TraceRayInline` / `RayQuery`).
+pub const SLOT_TLAS: u8 = 252;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -107,6 +110,9 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    /// Requires DXR Tier 1.1 (`RayQuery` / `TraceRayInline`): bit 25 in DXIL
+    /// `ShaderFlags` (`0x0200_0000`), bit 20 in `SFI0` (`0x0010_0000`).
+    pub const RAYTRACING_TIER_1_1: u64 = 1 << 25;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -217,6 +223,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Native DXR 1.1 TLAS SRV (`RaytracingAccelerationStructure`) bound at
+    /// `t<slot>` in [`ROOT_CBV_SPACE`].
+    pub tlas: Option<(u8, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -274,6 +283,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            tlas: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -387,6 +397,33 @@ impl Shader {
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_srvs.push((slot, h));
+        h
+    }
+
+    /// The handle of the native DXR 1.1 `RaytracingAccelerationStructure` SRV at
+    /// `t<slot>` in [`ROOT_CBV_SPACE`].
+    pub fn tlas_handle(&mut self, slot: u8) -> V {
+        if let Some((prev, h)) = self.tlas {
+            debug_assert_eq!(prev, slot);
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        // DXIL resource kind 16 = RTAccelerationStructure.
+        let h = self.annotate(block, h, 16, 0);
+        self.flags |= flags::RAYTRACING_TIER_1_1;
+        self.tlas = Some((slot, h));
         h
     }
 
@@ -585,6 +622,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.tlas.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -639,31 +677,64 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
-                let ty = self
-                    .m
-                    .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
-                let p = self.m.ptr(ty);
-                let u = self.m.undef(p);
+            if !self.root_srvs.is_empty() || self.tlas.is_some() {
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                if !self.root_srvs.is_empty() {
+                    let ty = self
+                        .m
+                        .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
+                    let p = self.m.ptr(ty);
+                    let u = self.m.undef(p);
+                    for (slot, _) in self.root_srvs.clone() {
+                        let id = list.len() as u32;
+                        let ops = vec![
+                            Some(i32c(&mut self, id)),
+                            Some(self.m.md_value(u)),
+                            Some(empty),
+                            Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                            Some(i32c(&mut self, u32::from(slot))),
+                            Some(i32c(&mut self, 1)),
+                            Some(i32c(&mut self, 11)),
+                            Some(i32c(&mut self, 0)),
+                            None,
+                        ];
+                        list.push(Some(self.m.md_node(ops)));
+                        bindings.push(Binding {
+                            kind: 4,
+                            space: ROOT_CBV_SPACE,
+                            register: u32::from(slot),
+                            dxil_kind: 11,
+                        });
+                    }
+                }
+                if let Some((slot, _)) = self.tlas {
+                    let ty = self
+                        .m
+                        .named_struct("struct.RaytracingAccelerationStructure", vec![self.t.i32]);
+                    let p = self.m.ptr(ty);
+                    let u = self.m.undef(p);
+                    // Element type tag: !{i32 0, i32 4}
+                    let e0 = i32c(&mut self, 0);
+                    let e1 = i32c(&mut self, 4);
+                    let elem = self.m.md_node(vec![Some(e0), Some(e1)]);
+                    let id = list.len() as u32;
                     let ops = vec![
-                        Some(i32c(&mut self, n as u32)),
+                        Some(i32c(&mut self, id)),
                         Some(self.m.md_value(u)),
                         Some(empty),
                         Some(i32c(&mut self, ROOT_CBV_SPACE)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
-                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, 16)),
                         Some(i32c(&mut self, 0)),
-                        None,
+                        Some(elem),
                     ];
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
-                        dxil_kind: 11,
+                        dxil_kind: 16,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
@@ -908,6 +979,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::RAYTRACING_TIER_1_1 != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

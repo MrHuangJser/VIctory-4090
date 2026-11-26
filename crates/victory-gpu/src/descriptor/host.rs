@@ -3985,6 +3985,80 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Counts how many unaligned bindless CBVs were copied into 256-byte aligned
+/// upload slabs so title shaders do not read zeroed null descriptors.
+static UNALIGNED_CBV_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct UnalignedCbvPool {
+    slabs: Vec<(ID3D12Resource, u64, usize)>,
+    used: usize,
+}
+
+static UNALIGNED_CBV_POOL: Mutex<Option<UnalignedCbvPool>> = Mutex::new(None);
+
+/// Copies a bindless CBV whose host copy GPU address is not 256-byte aligned
+/// into a 256-byte-aligned 4 MiB upload slab slice.
+fn copy_unaligned_cbv(host: &crate::host::Host, address: u64, size: u32) -> Option<(ID3D12Resource, u64, u32)> {
+    const SLAB_BYTES: usize = 4 << 20;
+    let aligned = constant_bytes(size).max(256);
+    let align_usize = aligned as usize;
+    let copy_len = (size as usize).min(align_usize);
+
+    // Read title memory first (before taking the slab lock) so an unmapped read
+    // never wastes slab space. Use stack buffer for common small CBVs.
+    let mut stack_buf = [0u8; 4096];
+    let mut heap_buf;
+    let slice = if copy_len <= stack_buf.len() {
+        &mut stack_buf[..copy_len]
+    } else {
+        heap_buf = vec![0u8; copy_len];
+        &mut heap_buf[..]
+    };
+    if !crate::host::read_into(address as *const u8, slice) {
+        return None;
+    }
+
+    let mut guard = UNALIGNED_CBV_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = guard.get_or_insert_with(|| UnalignedCbvPool {
+        slabs: Vec::new(),
+        used: SLAB_BYTES,
+    });
+    if pool.slabs.is_empty() || pool.used + align_usize > SLAB_BYTES {
+        let (buf, ptr) = host.upload_buffer(SLAB_BYTES as u64)?;
+        crate::host::name(&buf, || "unaligned bindless CBVs".to_owned());
+        // SAFETY: live upload buffer of `SLAB_BYTES`.
+        let gpu_base = unsafe { buf.GetGPUVirtualAddress() };
+        pool.slabs.push((buf, gpu_base, ptr as usize));
+        pool.used = 0;
+        // Retain up to 16 slabs (64 MiB) before dropping the oldest ones.
+        if pool.slabs.len() > 16 {
+            pool.slabs.remove(0);
+        }
+    }
+    let (buf, gpu_base, cpu_base) = pool.slabs.last()?;
+    let off = pool.used;
+    pool.used += align_usize;
+    // SAFETY: `off + align_usize <= SLAB_BYTES` inside the live mapped slab.
+    unsafe {
+        let dst = (*cpu_base as *mut u8).add(off);
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), dst, copy_len);
+        if align_usize > copy_len {
+            std::ptr::write_bytes(dst.add(copy_len), 0, align_usize - copy_len);
+        }
+    }
+    let count = UNALIGNED_CBV_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if count <= 4 || count.is_power_of_two() || count.is_multiple_of(4096) {
+        tracing::info!(
+            count,
+            address = format_args!("{address:#x}"),
+            size,
+            aligned,
+            "aligned unaligned bindless CBV into upload slab"
+        );
+    }
+    Some((buf.clone(), *gpu_base + off as u64, aligned))
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4005,25 +4079,32 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: constant_bytes(size),
+            let (kept_buf, desc) = if gpu % 256 == 0 {
+                (
+                    shadow.buffer.clone(),
+                    D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: gpu,
+                        SizeInBytes: constant_bytes(size),
+                    },
+                )
+            } else {
+                let (slab, aligned_gpu, aligned_size) = copy_unaligned_cbv(host, address, size)?;
+                (
+                    slab,
+                    D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: aligned_gpu,
+                        SizeInBytes: aligned_size,
+                    },
+                )
             };
-            // SAFETY: slots of our heap; the range lies in the host copy.
+            // SAFETY: slots of our heap; the range lies in `kept_buf`.
             unsafe {
                 device.CreateConstantBufferView(Some(&desc), at);
                 if let Some(twin) = twin {
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            Some(Some(kept_buf))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -4954,6 +5035,23 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    #[test]
+    fn unaligned_cbv_is_copied_into_256_byte_aligned_upload_slab() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory = vec![0xA5u8; 256 << 10];
+        let base = (memory.as_ptr() as u64).next_multiple_of(64 << 10);
+        // 16-byte aligned, but NOT 256-byte aligned (matching Xbox GPU rules).
+        let unaligned = base + 0x30;
+        assert!(make(&View::Constant(unaligned, 48), heap.cpu(0)).is_some());
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.

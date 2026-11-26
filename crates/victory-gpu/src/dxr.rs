@@ -392,6 +392,76 @@ impl DxrBridge {
             instance_count,
         })
     }
+
+    /// Builds a native Ada BLAS from an RDNA2 64-byte header + element block at
+    /// `arena + header_offset` (`elem_offset = header_offset + header[13] * 64`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_blas_from_arena_header(
+        &self,
+        host_gpu: &Host,
+        device5: &ID3D12Device5,
+        list4: &ID3D12GraphicsCommandList4,
+        arena: &ID3D12Resource,
+        header_offset: u64,
+        header: &[u32; 16],
+        fast_trace: bool,
+    ) -> windows::core::Result<Blas> {
+        let word0 = header[0];
+        let flags = word0 >> 16;
+        if word0 & 0xFFFF != 6 || flags & FLAG_PACKED != 0 || flags & FLAG_BLAS == 0 {
+            return Err(windows::core::Error::empty());
+        }
+        let elem_offset = header_offset + u64::from(header[13]) * NODE_BYTES;
+        let src_offset = u32::try_from(elem_offset).map_err(|_| windows::core::Error::empty())?;
+        let tri_node_count = header[3];
+        if tri_node_count == 0 {
+            return Err(windows::core::Error::empty());
+        }
+        self.build_blas_from_rdna_nodes(
+            host_gpu,
+            device5,
+            list4,
+            arena,
+            src_offset,
+            tri_node_count,
+            fast_trace,
+        )
+    }
+
+    /// Builds a native Ada TLAS from an RDNA2 64-byte header + instance block at
+    /// `arena + header_offset` (`elem_offset = header_offset + header[13] * 64`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_tlas_from_arena_header(
+        &self,
+        host_gpu: &Host,
+        device5: &ID3D12Device5,
+        list4: &ID3D12GraphicsCommandList4,
+        arena: &ID3D12Resource,
+        header_offset: u64,
+        header: &[u32; 16],
+        blas_va_table: &ID3D12Resource,
+    ) -> windows::core::Result<Tlas> {
+        let word0 = header[0];
+        let flags = word0 >> 16;
+        if word0 & 0xFFFF != 6 || flags & FLAG_PACKED != 0 || flags & FLAG_BLAS != 0 {
+            return Err(windows::core::Error::empty());
+        }
+        let elem_offset = header_offset + u64::from(header[13]) * NODE_BYTES;
+        let src_offset = u32::try_from(elem_offset).map_err(|_| windows::core::Error::empty())?;
+        let instance_count = header[3];
+        if instance_count == 0 {
+            return Err(windows::core::Error::empty());
+        }
+        self.build_tlas_from_instances(
+            host_gpu,
+            device5,
+            list4,
+            arena,
+            src_offset,
+            instance_count,
+            blas_va_table,
+        )
+    }
 }
 
 #[allow(dead_code)]
@@ -482,12 +552,28 @@ pub(crate) fn create_tlas_srv(
     }
 }
 
-/// Tracks title BVH headers observed by `memory.rs` when `VICTORY_DXR=1`.
+/// Tracks title BVH headers and GPU arena structures observed by `memory.rs`
+/// when `VICTORY_DXR=1`.
 #[derive(Default)]
 struct DxrRegistry {
     structures: HashMap<u64, StructureInfo>,
     blas_seen: u64,
     tlas_seen: u64,
+    static_packed: HashMap<u64, u64>,
+    static_packed_events: u64,
+    dynamic_built: HashMap<u64, BuiltEntry>,
+    dynamic_built_events: u64,
+    #[allow(dead_code)]
+    tlas_vas: HashMap<u64, u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct BuiltEntry {
+    first_frame: u64,
+    last_frame: u64,
+    rebuilds: u64,
+    arena_offset: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -502,6 +588,7 @@ struct StructureInfo {
 static REGISTRY: Mutex<Option<DxrRegistry>> = Mutex::new(None);
 
 /// Records a rehydrated/built BVH header when `VICTORY_DXR=1` is active (no-op otherwise).
+#[allow(dead_code)]
 pub(crate) fn note_structure(title_addr: u64, header_dwords: [u32; 16]) {
     if !enabled() {
         return;
@@ -544,6 +631,75 @@ pub(crate) fn note_structure(title_addr: u64, header_dwords: [u32; 16]) {
     }
 }
 
+/// Records a packed static world BVH structure streamed into an arena
+/// (`Memory::land`) when `VICTORY_DXR=1` is active.
+pub(crate) fn note_packed_structure(title_addr: u64, packed_len: u64, header_u64: u64) {
+    if !enabled() {
+        return;
+    }
+    let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let reg = reg.get_or_insert_with(DxrRegistry::default);
+    reg.static_packed_events += 1;
+    let is_new = reg.static_packed.insert(title_addr, packed_len).is_none();
+    let n = reg.static_packed.len() as u64;
+    if is_new && (n <= 4 || n == 64 || n.is_multiple_of(512)) {
+        let total_mb = reg.static_packed.values().sum::<u64>() / (1 << 20);
+        tracing::info!(
+            addr = format_args!("{title_addr:#x}"),
+            packed_len,
+            header = format_args!("{header_u64:#x}"),
+            unique_static = n,
+            total_static_mb = total_mb,
+            events = reg.static_packed_events,
+            "victory dxr: observed static packed BVH structure"
+        );
+    }
+}
+
+/// Records a dynamic BVH structure submitted by `Memory::ready` for GPU build
+/// when `VICTORY_DXR=1` is active.
+pub(crate) fn note_built_structure(title_addr: u64, frame: u64, arena_offset: Option<u64>) {
+    if !enabled() {
+        return;
+    }
+    let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let reg = reg.get_or_insert_with(DxrRegistry::default);
+    reg.dynamic_built_events += 1;
+    let entry = reg.dynamic_built.entry(title_addr).or_insert(BuiltEntry {
+        first_frame: frame,
+        last_frame: frame,
+        rebuilds: 0,
+        arena_offset,
+    });
+    let is_new = entry.rebuilds == 0;
+    entry.last_frame = frame;
+    entry.rebuilds += 1;
+    if arena_offset.is_some() {
+        entry.arena_offset = arena_offset;
+    }
+    let rebuilds = entry.rebuilds;
+    let n = reg.dynamic_built.len() as u64;
+    let ev = reg.dynamic_built_events;
+    if (is_new && (n <= 4 || n == 64 || n.is_multiple_of(512))) || ev.is_multiple_of(4096) {
+        tracing::info!(
+            addr = format_args!("{title_addr:#x}"),
+            frame,
+            arena_offset = ?arena_offset,
+            unique_dynamic = n,
+            total_build_events = ev,
+            rebuilds,
+            "victory dxr: observed GPU-built dynamic BVH structure"
+        );
+    }
+}
+
+/// Looks up the native Ada TLAS GPU virtual address for `title_addr` (if built).
+#[allow(dead_code)]
+pub(crate) fn tlas_gpu_va(title_addr: u64) -> Option<u64> {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    reg.as_ref()?.tlas_vas.get(&title_addr).copied()
+}
+
 /// Ensures the global `DxrBridge` is initialized on `host` (if DXR Tier 1.1 is available).
 #[allow(dead_code)]
 pub(crate) fn bridge(host_gpu: &Host) -> Option<&'static DxrBridge> {
@@ -565,6 +721,7 @@ pub(crate) fn bridge(host_gpu: &Host) -> Option<&'static DxrBridge> {
 }
 
 /// Helper to read the first 16 dwords of a structure at `title_addr` cleanly.
+#[allow(dead_code)]
 pub(crate) fn read_header(title_addr: u64) -> Option<[u32; 16]> {
     if !enabled() || title_addr < (1u64 << 32) {
         return None;
@@ -1588,6 +1745,279 @@ void main(uint3 id : SV_DispatchThreadID) {
             mrays / (rt_med / 1e3)
         );
         eprintln!("  RT Core Speedup: {:.2}x faster", sw_med / rt_med);
+    }
+
+    #[test]
+    fn dxr_phase2_arena_header_to_ada_blas_tlas() {
+        let Some(mut gpu) = GpuRunner::new() else {
+            eprintln!("no DXR Tier 1.1 hardware; skipped");
+            return;
+        };
+        let Some(trace_dxil) = compile_sm66_dxc(RAYQUERY_TRACE_HLSL, "victory_dxr_arena_hdr", false) else {
+            eprintln!("dxc.exe not found; skipped");
+            return;
+        };
+        let bridge = DxrBridge::new(&gpu.host.device).expect("DxrBridge");
+
+        // Lay out a mock GPU arena containing:
+        //  - offset 0x100: 64B BLAS header + 1 node at elem offset 2 (0x180)
+        //  - offset 0x400: 64B TLAS header + 1 instance at elem offset 1 (0x440)
+        let v0 = [-1.0f32, -1.0, 2.0];
+        let v1 = [0.0f32, 1.5, 2.0];
+        let v2 = [1.0f32, -1.0, 2.0];
+        let node = make_rdna_tri_node([v0, v1, v2, v0, v0], [1 | (2 << 2), 0, 0, 0]);
+        let mut blas_hdr = [0u32; 16];
+        blas_hdr[0] = 6 | (FLAG_BLAS << 16);
+        blas_hdr[1] = 3;
+        blas_hdr[3] = 1;
+        blas_hdr[13] = 2; // elem_offset = 0x100 + 2 * 64 = 0x180
+
+        let mut arena_bytes = vec![0u8; 4096];
+        // SAFETY: slice bounds inside 4096-byte arena buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(blas_hdr.as_ptr().cast::<u8>(), arena_bytes.as_mut_ptr().add(0x100), 64);
+            std::ptr::copy_nonoverlapping(node.as_ptr().cast::<u8>(), arena_bytes.as_mut_ptr().add(0x180), 64);
+        }
+
+        let (arena_buf, arena_ptr) = gpu.host.shared_buffer(4096).unwrap();
+        // SAFETY: mapped 4096-byte buffer.
+        unsafe { std::ptr::copy_nonoverlapping(arena_bytes.as_ptr(), arena_ptr, 4096) };
+
+        let blas = bridge
+            .build_blas_from_arena_header(&gpu.host, &gpu.device5, &gpu.list4, &arena_buf, 0x100, &blas_hdr, true)
+            .expect("build_blas_from_arena_header");
+
+        let ident = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 5.0];
+        let inst = make_rdna_instance(ident, 42, 0xFF, 0, 0, 0, 0);
+        let mut tlas_hdr = [0u32; 16];
+        tlas_hdr[0] = 6; // version=6, BLAS=0, PACKED=0
+        tlas_hdr[1] = 3;
+        tlas_hdr[3] = 1;
+        tlas_hdr[13] = 1; // elem_offset = 0x400 + 1 * 64 = 0x440
+        // SAFETY: mapped 4096-byte buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(tlas_hdr.as_ptr().cast::<u8>(), arena_ptr.add(0x400), 64);
+            std::ptr::copy_nonoverlapping(inst.as_ptr().cast::<u8>(), arena_ptr.add(0x440), 128);
+        }
+
+        let (va_table_buf, va_ptr) = gpu.host.shared_buffer(64).unwrap();
+        // SAFETY: 64-byte shared VA table.
+        unsafe { std::ptr::write(va_ptr.cast::<u64>(), blas.gpu_va) };
+
+        let tlas = bridge
+            .build_tlas_from_arena_header(&gpu.host, &gpu.device5, &gpu.list4, &arena_buf, 0x400, &tlas_hdr, &va_table_buf)
+            .expect("build_tlas_from_arena_header");
+
+        let (root, pso, heap, tlas_h) = unsafe {
+            let root: ID3D12RootSignature = gpu.host.device.CreateRootSignature(0, &trace_dxil).unwrap();
+            let pso: ID3D12PipelineState = gpu.host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: trace_dxil.as_ptr().cast(), BytecodeLength: trace_dxil.len() },
+                ..Default::default()
+            }).unwrap();
+            let heap: ID3D12DescriptorHeap = gpu.host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            }).unwrap();
+            create_tlas_srv(&gpu.host.device, tlas.gpu_va, heap.GetCPUDescriptorHandleForHeapStart());
+            let h = heap.GetGPUDescriptorHandleForHeapStart();
+            (root, pso, heap, h)
+        };
+        let ray_in = [RayInput { origin: [0.0, 0.0, 0.0], tmin: 0.0, dir: [0.0, 0.0, 1.0], tmax: 100.0 }];
+        let (rays_buf, rays_ptr) = gpu.host.shared_buffer(size_of::<RayInput>() as u64).unwrap();
+        let (out_buf, out_ptr) = gpu.host.shared_buffer(size_of::<RayResult>() as u64).unwrap();
+        // SAFETY: live mapped buffers and command list.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ray_in.as_ptr(), rays_ptr.cast(), 1);
+            std::ptr::write_bytes(out_ptr, 0, size_of::<RayResult>());
+            gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            gpu.list.SetComputeRootSignature(&root);
+            gpu.list.SetPipelineState(&pso);
+            let n = 1u32;
+            gpu.list.SetComputeRoot32BitConstants(0, 1, (&raw const n).cast(), 0);
+            gpu.list.SetComputeRootDescriptorTable(1, tlas_h);
+            gpu.list.SetComputeRootShaderResourceView(2, rays_buf.GetGPUVirtualAddress());
+            gpu.list.SetComputeRootUnorderedAccessView(3, out_buf.GetGPUVirtualAddress());
+            gpu.list.Dispatch(1, 1, 1);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: GPU finished writing 1 RayResult.
+        let res = unsafe { *out_ptr.cast::<RayResult>() };
+        assert_eq!(res.hit, 1);
+        assert_eq!(res.instance_id, 42);
+        assert!((res.hit_t - 7.0).abs() < 1e-4, "expected t=7.0, got {}", res.hit_t);
+        drop((blas, tlas));
+    }
+
+    #[test]
+    fn dxr_phase2_victory_shader_emitted_rayquery_runs_on_rt_cores() {
+        let Some(mut gpu) = GpuRunner::new() else {
+            eprintln!("no DXR Tier 1.1 hardware; skipped");
+            return;
+        };
+        let mut trace_dxil = victory_shader::emit::rayquery::build_rayquery_smoke_cs();
+        if let Ok(mut v) = victory_shader::emit::validator::Validator::load(None) {
+            v.validate(&mut trace_dxil)
+                .expect("dxil.dll sign emitted RayQuery shader");
+        }
+
+        let bridge = DxrBridge::new(&gpu.host.device).expect("DxrBridge");
+        let v0 = [-1.0f32, -1.0, 0.0];
+        let v1 = [0.0f32, 1.5, 0.0];
+        let v2 = [1.0f32, -1.0, 0.0];
+        let node0 = make_rdna_tri_node([v0, v1, v2, v0, v0], [1 | (2 << 2), 0, 0, 0]);
+        let (rdna_buf, rdna_ptr) = gpu.host.shared_buffer(64).unwrap();
+        // SAFETY: 64-byte mapped RDNA node buffer.
+        unsafe { std::ptr::copy_nonoverlapping(node0.as_ptr().cast::<u8>(), rdna_ptr, 64) };
+        let blas = bridge
+            .build_blas_from_rdna_nodes(&gpu.host, &gpu.device5, &gpu.list4, &rdna_buf, 0, 1, true)
+            .expect("build_blas");
+
+        let ident = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 4.0];
+        let inst = make_rdna_instance(ident, 99, 0xFF, 0, 0, 0, 0);
+        let (inst_buf, inst_ptr) = gpu.host.shared_buffer(128).unwrap();
+        // SAFETY: 128-byte mapped instance buffer.
+        unsafe { std::ptr::copy_nonoverlapping(inst.as_ptr().cast::<u8>(), inst_ptr, 128) };
+        let (va_buf, va_ptr) = gpu.host.shared_buffer(64).unwrap();
+        // SAFETY: 64-byte VA table.
+        unsafe { std::ptr::write(va_ptr.cast::<u64>(), blas.gpu_va) };
+        let tlas = bridge
+            .build_tlas_from_instances(&gpu.host, &gpu.device5, &gpu.list4, &inst_buf, 0, 1, &va_buf)
+            .expect("build_tlas");
+
+        // Build D3D12 root signature matching victory-shader's emit bindings:
+        // param 0 = DescriptorTable(SRV(t252, space=1)), param 1 = SRV(t0, space=1), param 2 = UAV(u0, space=1)
+        let range = D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: u32::from(victory_shader::emit::SLOT_TLAS),
+            RegisterSpace: victory_shader::emit::ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let params = [
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: victory_shader::emit::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: victory_shader::emit::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let rs_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: params.len() as u32,
+                    pParameters: params.as_ptr(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                },
+            },
+        };
+        let (root, pso, heap, tlas_h) = unsafe {
+            let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+            let mut err: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&rs_desc, &mut blob, Some(&mut err))
+                .expect("serialize RayQuery smoke root signature");
+            let blob = blob.unwrap();
+            let rs_bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            let root: ID3D12RootSignature = gpu.host.device.CreateRootSignature(0, rs_bytes).unwrap();
+            let pso: ID3D12PipelineState = gpu
+                .host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: trace_dxil.as_ptr().cast(),
+                        BytecodeLength: trace_dxil.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("RTX 4090 D CreateComputePipelineState for victory-shader emitted RayQuery CS");
+            let heap: ID3D12DescriptorHeap = gpu
+                .host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            create_tlas_srv(&gpu.host.device, tlas.gpu_va, heap.GetCPUDescriptorHandleForHeapStart());
+            let h = heap.GetGPUDescriptorHandleForHeapStart();
+            (root, pso, heap, h)
+        };
+
+        let rays = [
+            RayInput { origin: [0.0, 0.0, 0.0], tmin: 0.0, dir: [0.0, 0.0, 1.0], tmax: 100.0 },
+            RayInput { origin: [5.0, 5.0, 0.0], tmin: 0.0, dir: [0.0, 0.0, 1.0], tmax: 100.0 },
+        ];
+        let (rays_buf, rays_ptr) = gpu.host.shared_buffer((rays.len() * size_of::<RayInput>()) as u64).unwrap();
+        let (out_buf, out_ptr) = gpu.host.shared_buffer((rays.len() * size_of::<RayResult>()) as u64).unwrap();
+        // SAFETY: live mapped buffers and open command list.
+        unsafe {
+            std::ptr::copy_nonoverlapping(rays.as_ptr(), rays_ptr.cast(), rays.len());
+            std::ptr::write_bytes(out_ptr, 0, rays.len() * size_of::<RayResult>());
+            gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            gpu.list.SetComputeRootSignature(&root);
+            gpu.list.SetPipelineState(&pso);
+            gpu.list.SetComputeRootDescriptorTable(0, tlas_h);
+            gpu.list.SetComputeRootShaderResourceView(1, rays_buf.GetGPUVirtualAddress());
+            gpu.list.SetComputeRootUnorderedAccessView(2, out_buf.GetGPUVirtualAddress());
+            gpu.list.Dispatch(1, 1, 1);
+        }
+        gpu.submit_and_wait();
+
+        let res = unsafe { std::slice::from_raw_parts(out_ptr.cast::<RayResult>(), rays.len()) };
+        assert_eq!(res[0].hit, 1, "hit ray missed on victory-shader emitted RayQuery CS");
+        assert_eq!(res[0].instance_id, 99);
+        assert!((res[0].hit_t - 4.0).abs() < 1e-4, "expected t=4.0, got {}", res[0].hit_t);
+        let cpu_tri = [v0, v1, v2].map(|p| [p[0], p[1], p[2] + 4.0]);
+        let cpu_hit = bvh::triangle(&cpu_tri, &bvh::Ray::new(rays[0].origin, rays[0].dir, rays[0].tmax));
+        let cx = cpu_hit[2] / cpu_hit[1];
+        let cy = cpu_hit[3] / cpu_hit[1];
+        assert!(
+            (res[0].bary_x - cx).abs() < 1e-4 && (res[0].bary_y - cy).abs() < 1e-4,
+            "bary mismatch: gpu=({},{}) cpu=({cx},{cy})",
+            res[0].bary_x,
+            res[0].bary_y
+        );
+        assert_eq!(res[1].hit, 0, "miss ray unexpectedly hit");
+        eprintln!(
+            "VICTORY-SHADER NATIVE SM 6.6 RAYQUERY VERIFIED ON RTX 4090 D RT CORES: hit t={}, inst={}, bary=({:.4}, {:.4})",
+            res[0].hit_t, res[0].instance_id, res[0].bary_x, res[0].bary_y
+        );
+        drop((blas, tlas));
     }
 }
 
