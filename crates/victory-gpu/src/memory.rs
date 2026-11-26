@@ -424,6 +424,7 @@ impl Memory {
             }
         }
         self.stats.gone += 1;
+        crate::dxr::note_structure_gone(address);
     }
 
     /// Whether the packed structure at `address` is still in title memory.
@@ -995,22 +996,23 @@ pub(crate) fn ready(
                 m.small(list, start, len);
             }
             m.opens(at);
-            if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+            let in_buf = crate::shadow::in_buffer(at, 1);
+            if !packed && in_buf.is_none() {
                 let before = held(m);
                 m.ready(at, BUILT);
                 came[1] += held(m).saturating_sub(before);
-                if crate::dxr::enabled() {
-                    let arena_off = m.pages.get(&(at / PAGE)).map(|held| {
-                        let base = held.at - m.copies[held.copy].span().0 as usize;
-                        base as u64 + (at % PAGE)
-                    });
-                    crate::dxr::note_built_structure(at, frame, arena_off);
-                }
                 #[cfg(feature = "diagnostics")]
                 {
                     let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
+            }
+            if !packed && crate::dxr::enabled() && in_buf.is_none_or(|(_, len)| len > BACK) {
+                let arena_off = m.pages.get(&(at / PAGE)).map(|held| {
+                    let base = held.at - m.copies[held.copy].span().0 as usize;
+                    base as u64 + (at % PAGE)
+                });
+                crate::dxr::note_built_structure(at, frame, arena_off);
             }
         }
         if packed || !named(2, at) {
@@ -1065,6 +1067,9 @@ pub(crate) fn ready(
         #[cfg(feature = "diagnostics")]
         m.dump(list, addresses);
     }
+    if use_ == Use::Reads && crate::dxr::enabled() && !addresses.is_empty() {
+        crate::dxr::note_walked_structures(addresses, frame);
+    }
     #[cfg(feature = "diagnostics")]
     if use_ == Use::Reads {
         m.dump.walked(addresses);
@@ -1075,6 +1080,17 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// Snapshot of `Memory`'s GPU page directory buffer and arena/copy buffers
+/// for DXR 1.1 paged-arena acceleration structure construction.
+/// Releases the `MEMORY` mutex immediately after COM `AddRef` cloning.
+pub(crate) fn gpu_snapshot() -> Option<(ID3D12Resource, Vec<ID3D12Resource>)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    let directory = m.directory.1.buffer.clone();
+    let copies = m.copies.iter().map(|s| s.buffer.clone()).collect();
+    Some((directory, copies))
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of

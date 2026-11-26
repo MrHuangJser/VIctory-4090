@@ -432,10 +432,13 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool, tight: bool) -> u64 {
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
+    const CRITICAL_MS: u64 = 1_000;
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
-    if avail < if tight { 4 * GIB } else { 2 * GIB } {
+    if tight && avail < 2 * GIB {
+        CRITICAL_MS
+    } else if avail < if tight { 4 * GIB } else { 2 * GIB } {
         HIGH_MS
     } else if avail < if tight { 8 * GIB } else { 4 * GIB } {
         MODERATE_MS
@@ -5878,6 +5881,13 @@ impl Host {
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
+            let dxr_list = if crate::dxr::enabled() {
+                // SAFETY: plain fence query; `self.submitted` serializes queue submission.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                crate::dxr::record_frame_work(self, *submitted, completed)
+            } else {
+                None
+            };
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
@@ -5891,6 +5901,12 @@ impl Host {
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
+                }
+                // Run DXR Phase 3 in its own ExecuteCommandLists so Memory's
+                // COMMON-state arena/directory buffers decay cleanly after the
+                // title's UAV writes before DXR binds them as SRVs.
+                if let Some(dxr) = dxr_list {
+                    self.queue.ExecuteCommandLists(&[Some(dxr)]);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -5989,6 +6005,18 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        if crate::dxr::enabled() {
+            // SAFETY: plain fence query; `self.submitted` serializes queue submission.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if let Some(dxr_list) = crate::dxr::record_frame_work(self, *submitted + 1, completed) {
+                *submitted += 1;
+                // SAFETY: closed list; own ExecuteCommandLists lets COMMON buffers decay cleanly.
+                unsafe {
+                    self.queue.ExecuteCommandLists(&[Some(dxr_list)]);
+                    let _ = self.queue.Signal(&self.fence, *submitted);
+                }
+            }
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -9061,6 +9089,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::telemetry::log_resources(host().and_then(|h| h.video_memory_groups()));
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -10855,6 +10884,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::ram_idle_for(Some(12 * gib), true, true), 10_000);
         assert_eq!(super::ram_idle_for(Some(6 * gib), false, true), 5_000);
         assert_eq!(super::ram_idle_for(Some(3 * gib), false, true), 2_000);
+        assert_eq!(super::ram_idle_for(Some(2 * gib - 1), false, true), 1_000);
     }
 }
 
