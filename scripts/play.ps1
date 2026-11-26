@@ -2,18 +2,19 @@
 # 24 GB VRAM, Resizable BAR) and 32 GB system RAM hosts.
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 #
-# Defaults: release build, Series S profile (20+ FPS target), VICTORY_WAIT_RESIDENT=0,
-# VICTORY_LEVELS_ON_DEMAND=1, VICTORY_CARD_AWAKE=1, VICTORY_LOG=warn, ReBAR 2 GiB.
+# Defaults: release build, Xbox Series S (XSS) + 1080p (VICTORY_DISPLAY_MODE=1920x1080),
+# 1 MiB card buffer threshold (avoids 6x compare-pass explosion from 64 KiB),
+# VICTORY_WAIT_RESIDENT=0, VICTORY_LEVELS_ON_DEMAND=1, VICTORY_CARD_AWAKE=1, ReBAR off.
 #
 # Common switches:
-# -SeriesX          switch from Series S to Series X profile (higher resolution/detail)
-# -RayTracing       enable the title's ray-traced indirect light (lit interiors)
+# -SeriesX          switch from Series S to Series X profile (still defaults to 1080p unless overridden)
+# -RayTracing       enable the title's ray-traced indirect light + DXR 1.1 RT Core bridge
 # -Diag             use target\diag build with INFO logging for diagnostics
 # -NoLog            console only (skip writing log file)
 # -Safe             disable newer optimizations (first thing to try if something breaks)
-# -NoDxr            disable DXR 1.1 RT Core bridge (VICTORY_DXR=1 is on by default)
+# -NoDxr            disable DXR 1.1 RT Core bridge when -RayTracing is enabled
 # -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB RAM hosts)
-# -SmallCardBuffers experimental: place small buffers (>= 64 KiB) in VRAM
+# -SmallCardBuffers opt-in: place >= 64 KiB buffers in VRAM (increases GPU compare passes)
 # -Console          explicit 'series-s' (default) or 'series-x'
 # -Build            explicit 'release' (default) or 'diag'
 # -More             extra env overrides: -More @{VICTORY_PANEL='1'}
@@ -59,15 +60,18 @@ $settings = @{
     VICTORY_LEVELS_ON_DEMAND    = '1'
     VICTORY_CARD_AWAKE          = '1'
     VICTORY_SKIP_PIPELINES      = 'none'
+    # Default display binding: Xbox Series S (XSS) + 1080p (override via -SeriesX / -More @{VICTORY_DISPLAY_MODE='...'})
+    VICTORY_DISPLAY_MODE        = '1920x1080'
     # NVIDIA Ada / RTX 4090 specific tuning:
-    # - 3 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (keeps free RAM > 3 GiB so textures stay sharp!)
+    # - Keep default 1 MiB card buffer threshold (avoids 3,400+ tiny buffers / 6x GPU compare-pass overhead from 64 KiB; use -SmallCardBuffers to opt in)
+    # - Keep ReBAR loose-window offload OFF by default (0) so 24 GiB VRAM stays reserved for textures & card buffers without spilling to shared SysRAM
     # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (eliminates 60-85s stalls)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
-    # - Enable DXR 1.1 RT Core bridge on DXR Tier 1.1 hosts
-    # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32
-    VICTORY_WINDOWS_BAR_MB      = '3072'
+    # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32 without busting shader cache across RT toggles
+    # - Enable DXR 1.1 RT Core bridge only when -RayTracing is enabled (zero overhead when RT is off)
+    VICTORY_WINDOWS_BAR_MB      = '0'
     VICTORY_WAIT_RESIDENT       = '0'
-    VICTORY_DXR                 = '1'
+    VICTORY_DXR                 = '0'
     VICTORY_FIRSTLANE_OWN       = '1'
     # Keep wide workers non-spinning by default so 12 thin-list + game threads never lose cores
     VICTORY_WIDE_SPIN           = '0'
@@ -75,8 +79,12 @@ $settings = @{
 if ($Diag) {
     $settings.VICTORY_D3D12_DRED = 'light'
 } else {
-    # Keep stdout lean (no per-resource/pipeline spam) while preserving 5s FPS/CPU/GPU/RAM/DXR + bake summaries
-    $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::land=info,victory_gpu::queue::behind=info,victory_gpu::dxr=info,victory_gpu::telemetry=info,victory_gpu::draw=info'
+    # Keep stdout/log lean (avoid per-second land/behind/draw I/O back-pressure) while keeping 5s FPS + CPU/GPU/RAM/VRAM telemetry
+    $settings.VICTORY_LOG = if ($RayTracing) {
+        'warn,victory_gpu::host=info,victory_gpu::telemetry=info,victory_gpu::dxr=info'
+    } else {
+        'warn,victory_gpu::host=info,victory_gpu::telemetry=info'
+    }
 }
 if (-not $RayTracing) {
     $settings.VICTORY_AMBIENT_AIR = '1.5'
@@ -98,13 +106,19 @@ if ($Safe) {
     $settings.VICTORY_WAIT_RESIDENT  = '1'
     $settings.VICTORY_DXR            = '0'
     $settings.VICTORY_WIDE_SPIN      = '0'
+    $settings.Remove('VICTORY_CARD_BUFFERS_MIN_KB')
 } else {
     $settings.VICTORY_THIN         = '1'
     $settings.VICTORY_JOIN_PARTS   = '8'
     $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
+if ($RayTracing) {
+    $settings.VICTORY_BVH_BUILDER = '1'
+    if (-not $NoDxr -and -not $Safe) {
+        $settings.VICTORY_DXR = '1'
+    }
+}
 if ($NoDxr) { $settings.VICTORY_DXR = '0' }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

@@ -179,7 +179,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 8), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
 }
 
@@ -2647,7 +2647,7 @@ impl State {
         // decoration bakes override this via `PASS_BUDGET` with `bake_ms` (1500 ms).
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24)
         }));
         // A backlog (a scene's first minutes) gets a bounded 2x boost while host
         // RAM is healthy, instead of 3x/750 ms which starved the GPU and spiked

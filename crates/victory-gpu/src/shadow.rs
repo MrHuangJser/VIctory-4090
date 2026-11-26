@@ -492,29 +492,18 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        if let Some(mb) = std::env::var("VICTORY_WINDOWS_BAR_MB")
+        // Opt-in only via `VICTORY_WINDOWS_BAR_MB=<MiB>`: on 24 GiB cards + 32 GiB
+        // RAM, reserving 2 GiB of local VRAM for loose windows pushes process VRAM
+        // over Windows' ~21.3 GiB budget, starving bindless textures (`no room for
+        // more`) and spilling 5-7 GiB back into shared system RAM.
+        let mb = std::env::var("VICTORY_WINDOWS_BAR_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            return mb << 20;
+            .unwrap_or(0);
+        if mb > 0 {
+            tracing::info!(mb, "ReBAR GPU_UPLOAD windows enabled (VICTORY_WINDOWS_BAR_MB)");
         }
-        // Auto-enable 3072 MiB ReBAR window offload on NVIDIA GPUs with
-        // Resizable BAR (GPUUploadHeapSupported), >= 20 GiB VRAM, and <= 36 GiB
-        // system RAM: verified 4.32x faster GPU reads (453 vs 105 GB/s) and
-        // shifts ~3 GiB of loose windows out of shared system RAM into VRAM.
-        // Set VICTORY_WINDOWS_BAR_MB=0 to disable.
-        let auto_mb = host().and_then(|h| {
-            let vram = h.video_memory().map(|[budget, ..]| budget).unwrap_or(0);
-            let auto = crate::indirect::nvidia(&h.device)
-                && h.mapped_card_memory()
-                && vram >= 20u64 << 30
-                && crate::host::tight_ram();
-            auto.then_some(3072u64)
-        }).unwrap_or(0);
-        if auto_mb > 0 {
-            tracing::info!(mb = auto_mb, "ReBAR GPU_UPLOAD windows auto-enabled (VICTORY_WINDOWS_BAR_MB=0: off)");
-        }
-        auto_mb << 20
+        mb << 20
     })
 }
 
@@ -529,15 +518,10 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory() {
-        // On >= 20 GiB VRAM cards (e.g. 24 GiB RTX 4090), allow ReBAR windows
-        // up to 88% of budget (~2.7 GiB headroom, still under resource::room's
-        // 90% ceiling) so windows keep offloading out of 32 GiB host RAM even
-        // after world textures fill local VRAM past 80%.
-        let cap_pct = if budget >= 20u64 << 30 { 88 } else { 80 };
-        if used + size > budget / 100 * cap_pct {
-            return None;
-        }
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -570,15 +554,10 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory() {
-        // On >= 20 GiB VRAM cards (e.g. 24 GiB RTX 4090), allow ReBAR windows
-        // up to 88% of budget (~2.7 GiB headroom, still under resource::room's
-        // 90% ceiling) so windows keep offloading out of 32 GiB host RAM even
-        // after world textures fill local VRAM past 80%.
-        let cap_pct = if budget >= 20u64 << 30 { 88 } else { 80 };
-        if used + size > budget / 100 * cap_pct {
-            return None;
-        }
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);

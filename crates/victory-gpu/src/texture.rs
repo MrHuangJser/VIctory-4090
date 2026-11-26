@@ -1455,36 +1455,20 @@ impl Staging {
     }
 
     /// Lock-free exact refresh while the runtime is remapping unrelated title
-    /// memory: first tries reading all `size` bytes through the kernel
-    /// (`read_into`). If the texture is partially mapped (e.g. streamed-out
-    /// higher mips during a scene cut), reads the mapped pages lock-free via
-    /// `read_there` and succeeds whenever all currently-mapped bytes were
-    /// captured cleanly. Only returns `None` (falling back to the global remap
-    /// lock) if a mapped page actually vanished mid-read.
+    /// memory: only succeeds if `read_into` captures all `size` bytes cleanly
+    /// through the kernel. If any page is unmapped (whether streamed-out or
+    /// temporarily unmapped mid-remap), returns `None` so the caller waits on
+    /// `title_memory_reading` instead of caching partial/zeroed bake bytes.
     fn refresh_unlocked_exact(&self, last: &mut Last, size: usize) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         let ok = with_read(size, |read| {
-            if crate::host::read_into(self.memory, read) {
-                let hash = digest(read);
-                if last.hash != Some(hash) {
-                    last.hash = Some(hash);
-                    self.detile(read);
-                }
-                return true;
-            }
-            // Partially mapped texture: read all mapped pages through the kernel
-            // without stalling behind unrelated remaps on other virtual ranges.
-            let got = crate::host::read_there(self.memory, read) as u64;
-            let there = mapped_bytes(self.memory, size);
-            if got < there {
+            if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            if got != 0 {
-                let hash = digest(read);
-                if last.hash != Some(hash) {
-                    last.hash = Some(hash);
-                    self.detile(read);
-                }
+            let hash = digest(read);
+            if last.hash != Some(hash) {
+                last.hash = Some(hash);
+                self.detile(read);
             }
             true
         });

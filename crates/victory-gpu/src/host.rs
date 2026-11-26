@@ -432,13 +432,10 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool, tight: bool) -> u64 {
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    const CRITICAL_MS: u64 = 1_000;
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
-    if tight && avail < 2 * GIB {
-        CRITICAL_MS
-    } else if avail < if tight { 4 * GIB } else { 2 * GIB } {
+    if avail < if tight { 4 * GIB } else { 2 * GIB } {
         HIGH_MS
     } else if avail < if tight { 8 * GIB } else { 4 * GIB } {
         MODERATE_MS
@@ -6006,18 +6003,6 @@ impl Host {
             }
             let _ = (i, started);
         }
-        if crate::dxr::enabled() {
-            // SAFETY: plain fence query; `self.submitted` serializes queue submission.
-            let completed = unsafe { self.fence.GetCompletedValue() };
-            if let Some(dxr_list) = crate::dxr::record_frame_work(self, *submitted + 1, completed) {
-                *submitted += 1;
-                // SAFETY: closed list; own ExecuteCommandLists lets COMMON buffers decay cleanly.
-                unsafe {
-                    self.queue.ExecuteCommandLists(&[Some(dxr_list)]);
-                    let _ = self.queue.Signal(&self.fence, *submitted);
-                }
-            }
-        }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -10884,7 +10869,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::ram_idle_for(Some(12 * gib), true, true), 10_000);
         assert_eq!(super::ram_idle_for(Some(6 * gib), false, true), 5_000);
         assert_eq!(super::ram_idle_for(Some(3 * gib), false, true), 2_000);
-        assert_eq!(super::ram_idle_for(Some(2 * gib - 1), false, true), 1_000);
     }
 }
 
