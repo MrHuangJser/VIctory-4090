@@ -48,8 +48,10 @@ $settings = @{
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
     #   and 100% match `victory.exe shaders` cache keys
     # - Enable Phase 1 DXR 1.1 RT Core bridge observer on DXR Tier 1.1 hosts
+    # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32
     VICTORY_WINDOWS_BAR_MB      = '2048'
     VICTORY_DXR                 = '1'
+    VICTORY_FIRSTLANE_OWN       = '1'
 }
 if ($SmallCardBuffers) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'

@@ -2713,8 +2713,30 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        if let Some(n) = std::env::var("VICTORY_LATE_WAIT_LISTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            return n.max(1);
+        }
+        let lim = victory_shader::emit::view_heap_limit();
+        let capped = lim > 0 && lim < crate::descriptor::host::PORTABLE_VIEWS;
+        if capped { 96 } else { 256 }
     })
+}
+
+/// Waits briefly for an in-flight batch to land and return its dynamic
+/// descriptor slots (`VICTORY_RELAY=1`). Returns `false` if nothing is in flight.
+pub(crate) fn wait_for_dynamic_slots() -> bool {
+    if !relay() {
+        return false;
+    }
+    let line = line();
+    if line.lists == 0 && !line.settling {
+        return false;
+    }
+    let _ = LINE_LANDED.wait_timeout(line, std::time::Duration::from_millis(50));
+    true
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -5003,7 +5025,7 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -5013,6 +5035,9 @@ impl Host {
                     }
                     if let Some(own) = flight.own {
                         own.landed();
+                    }
+                    for detached in &mut flight.lists {
+                        detached.release_tables();
                     }
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)

@@ -1428,7 +1428,7 @@ pub(crate) fn near_heaps(va: u64) -> String {
 
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+pub(crate) const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// The size of every host view heap on a host that takes more than
 /// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
@@ -1759,23 +1759,39 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        let cursor = *next as usize;
+        let n_usize = n as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let found = if enough {
-            taken.find_run(cursor, end, n).or_else(|| taken.find_run(0, second_end, n))
-        } else {
-            None
-        };
-        let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let mut found = None;
+        for attempt in 0..4 {
+            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let (next, taken) = &mut *guard;
+            let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
+                && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+            let cursor = *next as usize;
+            let second_end = cursor.saturating_add(n_usize.saturating_sub(1)).min(end);
+            let hit = if enough {
+                taken
+                    .find_run(cursor, end, n_usize)
+                    .or_else(|| taken.find_run(0, second_end, n_usize))
+            } else {
+                None
+            };
+            if let Some(first) = hit {
+                taken.mark(first, n_usize);
+                self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+                *next = ((first + n_usize) % end) as u32;
+                found = Some(self.count + first as u32);
+                break;
             }
+            if enough {
+                self.too_long.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
+            }
+            drop(guard);
+            if attempt == 3 || !crate::host::wait_for_dynamic_slots() {
+                break;
+            }
+        }
+        let Some(slot) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1788,10 +1804,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken.mark(first, n);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        Some(slot)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's

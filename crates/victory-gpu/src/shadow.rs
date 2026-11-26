@@ -5110,7 +5110,13 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        match std::env::var("VICTORY_WINDOW_TAILS").ok().as_deref().map(str::trim) {
+            Some("1") => true,
+            Some("0") => false,
+            _ => crate::host::tight_ram(),
+        }
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,

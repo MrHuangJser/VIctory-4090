@@ -203,6 +203,12 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Returns this list's dynamic descriptor slots to the heap immediately
+    /// after the GPU flight finishes, before the list object itself is reset.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

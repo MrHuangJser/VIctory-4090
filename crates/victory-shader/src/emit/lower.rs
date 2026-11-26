@@ -930,7 +930,7 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool], relax_rw: bool) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -976,7 +976,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if !relax_rw && (0..n).any(|r| reads[r] && writes[r]) {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1495,7 +1495,7 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, LOCAL_ANY.get()) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1508,7 +1508,8 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
-                        if lds_ok {
+                        let extra_lds = 1 + if crosses { 2 * group.div_ceil(64) } else { 0 };
+                        if lds_ok && s.lds_dwords + extra_lds <= 8192 {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
@@ -1549,7 +1550,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, &all, LOCAL_ANY.get()).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -8835,12 +8836,15 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
-                        // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
-                        // first lane, exact when the value is the same in every lane of
+                        // shortcut: `VICTORY_FIRSTLANE_OWN=1` (default on) takes the host wave's
+                        // own first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
+                        // Set `VICTORY_FIRSTLANE_OWN=0` to refuse diverging half-wave reads.
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                        if *OWN.get_or_init(|| {
+                            std::env::var_os("VICTORY_FIRSTLANE_OWN").is_none_or(|v| v != "0")
+                        }) {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
