@@ -700,6 +700,31 @@ pub(crate) fn tlas_gpu_va(title_addr: u64) -> Option<u64> {
     reg.as_ref()?.tlas_vas.get(&title_addr).copied()
 }
 
+/// Registers a built native Ada TLAS for `title_addr` and makes it the active
+/// TLAS for `SLOT_TLAS` root SRV bindings.
+#[allow(dead_code)]
+pub(crate) fn register_tlas(title_addr: u64, tlas: Tlas) -> u64 {
+    let gpu_va = tlas.gpu_va;
+    let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let reg = reg.get_or_insert_with(DxrRegistry::default);
+    reg.tlas_vas.insert(title_addr, gpu_va);
+    // Keep the backing ID3D12Resource alive in the registry alongside its VA.
+    ACTIVE_TLAS.lock().unwrap_or_else(|e| e.into_inner()).replace(tlas);
+    gpu_va
+}
+
+static ACTIVE_TLAS: Mutex<Option<Tlas>> = Mutex::new(None);
+
+/// Returns the GPU virtual address of the currently active native Ada TLAS
+/// (bound to `SLOT_TLAS` for hardware `RayQuery` dispatches), if one is ready.
+pub(crate) fn active_tlas_gpu_va() -> Option<u64> {
+    ACTIVE_TLAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|t| t.gpu_va)
+}
+
 /// Ensures the global `DxrBridge` is initialized on `host` (if DXR Tier 1.1 is available).
 #[allow(dead_code)]
 pub(crate) fn bridge(host_gpu: &Host) -> Option<&'static DxrBridge> {

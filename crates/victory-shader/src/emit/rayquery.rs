@@ -98,7 +98,7 @@ impl Shader {
 /// bitcode emitter (no `dxc.exe`) to verify end-to-end RT Core execution on the
 /// host GPU:
 /// - `t0` (`space1`): `ByteAddressBuffer` of 32-byte `RayIn { origin.xyz, tmin, dir.xyz, tmax }`
-/// - `t252` (`space1`, [`SLOT_TLAS`]): `RaytracingAccelerationStructure`
+/// - `t251` (`space1`, [`SLOT_TLAS`]): `RaytracingAccelerationStructure`
 /// - `u0` (`space1`): `RWByteAddressBuffer` of 32-byte `RayOut { hit, inst, prim, t, bx, by, 0, 0 }`
 pub fn build_rayquery_smoke_cs() -> Vec<u8> {
     let mut s = Shader::new(false);

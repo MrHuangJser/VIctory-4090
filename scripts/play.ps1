@@ -1,41 +1,48 @@
-# Starts the title with settings tuned for NVIDIA RTX 4090 (Ada Lovelace, 24 GB VRAM,
-# Resizable BAR) and 32 GB system RAM hosts (README.md, "How to run it").
+# Starts the title with unified settings tuned for NVIDIA RTX 4090 (Ada Lovelace,
+# 24 GB VRAM, Resizable BAR) and 32 GB system RAM hosts.
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
-# -Safe             without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing       the title's own ray-traced indirect light: lit interiors, heavier on the GPU
-# -NoDxr            disable the Phase 1 DXR 1.1 RT Core bridge observer (VICTORY_DXR=1 is on by default)
-# -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB physical RAM hosts)
-# -SmallCardBuffers experimental: place small buffers (>= 64 KiB) in VRAM (VICTORY_CARD_BUFFERS_MIN_KB=64)
-# -Awake            enable async-compute clock keep-awake (off by default on NVIDIA)
-# -Console          console profile: 'series-x' (default) or 'series-s' (lighter, matches cool_fox 25+ FPS target)
-# -Pareto           high-FPS preset: Series S + LevelsOnDemand + SmallCardBuffers + Awake + release build
-# -Build            target\diag (the default, with diagnostics) or target\release
-# -More             other settings: -More @{VICTORY_PANEL='1'}
-# -Log              custom log file path (outside repo; default: ..\captures\victory-YYYYMMDD-HHMMSS.log)
-# -NoLog            disable writing a log file (console only)
+#
+# Defaults: release build, Series S profile (20+ FPS target), VICTORY_WAIT_RESIDENT=0,
+# VICTORY_LEVELS_ON_DEMAND=1, VICTORY_CARD_AWAKE=1, VICTORY_LOG=warn, ReBAR 2 GiB.
+#
+# Common switches:
+# -SeriesX          switch from Series S to Series X profile (higher resolution/detail)
+# -RayTracing       enable the title's ray-traced indirect light (lit interiors)
+# -Diag             use target\diag build with INFO logging for diagnostics
+# -NoLog            console only (skip writing log file)
+# -Safe             disable newer optimizations (first thing to try if something breaks)
+# -NoDxr            disable DXR 1.1 RT Core bridge (VICTORY_DXR=1 is on by default)
+# -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB RAM hosts)
+# -SmallCardBuffers experimental: place small buffers (>= 64 KiB) in VRAM
+# -Console          explicit 'series-s' (default) or 'series-x'
+# -Build            explicit 'release' (default) or 'diag'
+# -More             extra env overrides: -More @{VICTORY_PANEL='1'}
+# -Log              custom log file path (default: ..\captures\victory-YYYYMMDD-HHMMSS.log)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
-    [switch]$Safe,
+    [switch]$SeriesX,
     [switch]$RayTracing,
+    [switch]$Diag,
+    [switch]$Safe,
     [switch]$NoDxr,
     [switch]$LowRam,
     [switch]$SmallCardBuffers,
-    [switch]$Awake,
     [switch]$Pareto,
-    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
+    [ValidateSet('release', 'diag')][string]$Build = 'release',
     [hashtable]$More = @{},
     [string]$Log = '',
     [switch]$NoLog
 )
-if ($Pareto) {
-    if (-not $PSBoundParameters.ContainsKey('Console')) { $Console = 'series-s' }
-    if (-not $PSBoundParameters.ContainsKey('Build'))   { $Build = 'release' }
-    $Awake = $true
+if ($SeriesX -and -not $PSBoundParameters.ContainsKey('Console')) {
+    $Console = 'series-x'
+}
+if ($Diag -and -not $PSBoundParameters.ContainsKey('Build')) {
+    $Build = 'diag'
 }
 $settings = @{
-    # Core async & GPU-side optimizations (ported from VIctory-7900XTX and verified on RTX 4090 D)
+    # Core async & GPU-side optimizations (merged VIctory-7900XTX + cool_fox + Victory-4090)
     VICTORY_TEXTURE_NO_WAIT     = '1'
     VICTORY_RELAY               = '2'
     VICTORY_WIDE_BACK           = '1'
@@ -50,19 +57,24 @@ $settings = @{
     VICTORY_TITLE_PRIORITIES    = '0'
     VICTORY_SHOW_AFTER          = '1'
     VICTORY_AMBIENT             = '0.8'
+    VICTORY_LEVELS_ON_DEMAND    = '1'
+    VICTORY_CARD_AWAKE          = '1'
     VICTORY_D3D12_DRED          = 'light'
     VICTORY_SKIP_PIPELINES      = 'none'
     # NVIDIA Ada / RTX 4090 specific tuning:
     # - 2 GiB read-only windows offloaded to VRAM via ReBAR GPU_UPLOAD (4.32x faster GPU reads, -2 GiB SysRAM)
-    # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (saves 60-85s of stalls & 200-2000ms spikes)
+    # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (eliminates 60-85s stalls)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
-    #   and 100% match `victory.exe shaders` cache keys
-    # - Enable Phase 1 DXR 1.1 RT Core bridge observer on DXR Tier 1.1 hosts
+    # - Enable DXR 1.1 RT Core bridge on DXR Tier 1.1 hosts
     # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32
     VICTORY_WINDOWS_BAR_MB      = '2048'
     VICTORY_WAIT_RESIDENT       = '0'
     VICTORY_DXR                 = '1'
     VICTORY_FIRSTLANE_OWN       = '1'
+}
+if (-not $Diag) {
+    # Keep stdout lean to prevent PowerShell pipe back-pressure
+    $settings.VICTORY_LOG = 'warn'
 }
 if (-not $RayTracing) {
     $settings.VICTORY_AMBIENT_AIR = '1.5'
@@ -70,27 +82,19 @@ if (-not $RayTracing) {
 if ($SmallCardBuffers) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
 }
-if ($Awake) {
-    $settings.VICTORY_CARD_AWAKE = '1'
-}
-if ($Pareto) {
-    $settings.VICTORY_LEVELS_ON_DEMAND = '1'
-    # Avoid PowerShell stdout pipe back-pressure from 18,000+ INFO lines (matches cool_fox Play-VIctory.cmd)
-    $settings.VICTORY_LOG              = 'warn'
-}
 if ($LowRam) {
-    $settings.VICTORY_LOW_RAM         = '1'
-    $settings.VICTORY_WINDOW_KB       = '1024'
-    $settings.VICTORY_WINDOW_TAILS    = '1'
-    $settings.VICTORY_LIST_POOL_MAX   = '128'
+    $settings.VICTORY_LOW_RAM          = '1'
+    $settings.VICTORY_WINDOW_KB        = '1024'
+    $settings.VICTORY_WINDOW_TAILS     = '1'
+    $settings.VICTORY_LIST_POOL_MAX    = '128'
     $settings.VICTORY_PIPELINE_WORKERS = '8'
 }
 if ($Safe) {
-    $settings.VICTORY_UNDER_WIDE = '0'
-    $settings.VICTORY_LAND_ECHO  = '0'
+    $settings.VICTORY_UNDER_WIDE     = '0'
+    $settings.VICTORY_LAND_ECHO      = '0'
     $settings.VICTORY_WINDOWS_BAR_MB = '0'
     $settings.VICTORY_WAIT_RESIDENT  = '1'
-    $settings.VICTORY_DXR        = '0'
+    $settings.VICTORY_DXR            = '0'
 } else {
     $settings.VICTORY_THIN         = '1'
     $settings.VICTORY_JOIN_PARTS   = '8'

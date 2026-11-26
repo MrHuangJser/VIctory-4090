@@ -102,7 +102,9 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// Root SRV `t<SLOT_TLAS>` in [`ROOT_CBV_SPACE`] for a native DXR 1.1
 /// `RaytracingAccelerationStructure` (`TraceRayInline` / `RayQuery`).
-pub const SLOT_TLAS: u8 = 252;
+/// Kept distinct from [`SLOT_TABLE_STRIDES`] (252), [`SLOT_FAULTS`] (253),
+/// [`SLOT_MEMORY`] (254), and [`SLOT_STRIDES`] (255).
+pub const SLOT_TLAS: u8 = 251;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;

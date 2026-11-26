@@ -1767,6 +1767,22 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_TLAS {
+                        // Ours: native DXR 1.1 RaytracingAccelerationStructure root SRV
+                        // for hardware RayQuery shaders on RTX 4090.
+                        match crate::dxr::active_tlas_gpu_va() {
+                            // SAFETY: an open list; TLAS buffer is retained in DxrRegistry.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a RayQuery shader bound SLOT_TLAS before any native TLAS was built"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
