@@ -306,12 +306,10 @@ pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
 
 /// Whether a record that does not fit in what is left of its list's budget
 /// takes the rest, so that every record after it runs empty too
-/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
-/// runs). A list whose budget one garbage record empties loses all its later
-/// draws, and which record that is may differ from frame to frame. The frame
-/// line says how many records a frame are refused.
+/// (`VICTORY_INDIRECT_REST=1`; off by default so one oversized record takes
+/// nothing and later valid draws still run).
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
@@ -2619,7 +2617,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// left then, and the records as clamped.
     fn four_records_of_a_group(rest: bool) -> Option<(u32, Vec<u32>)> {
         let mut warp = WarpHarness::new()?;
-        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+        let source = SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
         let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
@@ -2753,9 +2751,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-            // The small record comes after the big ones spent the budget:
-            // it runs empty, in every round alike (none carries over).
-            assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
+            // When `rest() != 0` the big records spend the rest of the budget,
+            // emptying the small one after them; when `rest() == 0` (default)
+            // an oversized record takes nothing, so the small one still runs.
+            let expected = if rest() == 0 { round + 1 } else { 0 };
+            assert_eq!(hits, expected, "round {round}: small record after oversized records");
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
@@ -2773,7 +2773,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         list.reset();
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-        assert_eq!(hits, 1, "the budget starts empty at the next submission");
+        let expected_final = if rest() == 0 { 3 } else { 1 };
+        assert_eq!(hits, expected_final, "the budget starts empty at the next submission");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
@@ -3359,7 +3360,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let asked = (1 << 26) * times * records as u32;
+            let expected_spent = if rest() != 0 {
+                BUDGET.min(asked)
+            } else {
+                (filled as u32) * (1 << 26) * times
+            };
+            assert_eq!(spent, expected_spent);
         }
     }
 

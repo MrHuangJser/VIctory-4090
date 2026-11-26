@@ -970,9 +970,8 @@ pub(crate) fn ready(
             if let Some((len, _)) = m.packed_at(at) {
                 packed = true;
                 for page in at / PAGE..=(at + len - 1) / PAGE {
-                    let new = m.copy_of(page).is_none();
-                    if m.map(page)
-                        && new
+                    if m.copy_of(page).is_none()
+                        && m.map(page)
                         && let Some(held) = m.pages.get_mut(&page)
                     {
                         held.theirs = true;
@@ -997,19 +996,21 @@ pub(crate) fn ready(
             }
             m.opens(at);
             if !packed && crate::shadow::in_buffer(at, 1).is_none() {
-                let arena_off = m.pages.get(&(at / PAGE)).map(|held| {
-                    let base = held.at - m.copies[held.copy].span().0 as usize;
-                    base as u64 + (at % PAGE)
-                });
-                crate::dxr::note_built_structure(at, frame, arena_off);
+                let before = held(m);
+                m.ready(at, BUILT);
+                came[1] += held(m).saturating_sub(before);
+                if crate::dxr::enabled() {
+                    let arena_off = m.pages.get(&(at / PAGE)).map(|held| {
+                        let base = held.at - m.copies[held.copy].span().0 as usize;
+                        base as u64 + (at % PAGE)
+                    });
+                    crate::dxr::note_built_structure(at, frame, arena_off);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
-                let before = held(m);
-                m.ready(at, BUILT);
-                came[1] += held(m).saturating_sub(before);
             }
         }
         if packed || !named(2, at) {
