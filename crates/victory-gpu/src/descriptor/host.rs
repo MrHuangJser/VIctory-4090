@@ -2654,6 +2654,34 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
+        self.note_word(index, Some(view));
+    }
+
+    /// Writes slot `index`'s word in the table of strides (stride and
+    /// integer format, `victory_shader::emit::SLOT_STRIDES`) for a dynamic
+    /// slot, which [`HostHeap::note_buffer`] never sees: shaders read typed
+    /// views of descriptor tables by it too (`VIEW_INTEGER`, d16 accesses of
+    /// the face network's UINT views).
+    fn note_word(&self, index: u32, view: Option<&View>) {
+        let word = view.map_or(0, |v| view_stride(v).unwrap_or(0) | view_kind(v));
+        if word & victory_shader::emit::VIEW_INTEGER != 0 {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                tracing::info!(
+                    index,
+                    count = n,
+                    elements = ?view.and_then(view_elements),
+                    "integer typed buffer view in a dynamic table slot (d16 accesses keep its bits)"
+                );
+            }
+        }
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; a dword, as `note_buffer` writes.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2695,6 +2723,7 @@ impl HostHeap {
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
+            self.note_word(index, Some(&made.view));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2725,6 +2754,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.note_word(index, None);
         }
         self.clear_twin(index);
         self.keep(index, None);
