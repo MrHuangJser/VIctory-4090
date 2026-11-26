@@ -3,7 +3,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 #
 # Defaults: release build, Xbox Series S (XSS) + 1080p (VICTORY_DISPLAY_MODE=1920x1080),
-# 1 MiB card buffer threshold (avoids 6x compare-pass explosion from 64 KiB),
+# VICTORY_CARD_BUFFERS_MIN_KB=64 (matches cool_fox; saves ~5 GiB RAM / ~2.6 GiB shared),
 # VICTORY_WAIT_RESIDENT=0, VICTORY_LEVELS_ON_DEMAND=1, VICTORY_CARD_AWAKE=1, ReBAR off.
 #
 # Common switches:
@@ -14,7 +14,7 @@
 # -Safe             disable newer optimizations (first thing to try if something breaks)
 # -NoDxr            disable DXR 1.1 RT Core bridge when -RayTracing is enabled
 # -LowRam           force the 32 GB RAM profile (auto-detected on <= 36 GB RAM hosts)
-# -SmallCardBuffers opt-in: place >= 64 KiB buffers in VRAM (increases GPU compare passes)
+# -SmallCardBuffers (on by default: places >= 64 KiB buffers in VRAM)
 # -Console          explicit 'series-s' (default) or 'series-x'
 # -Build            explicit 'release' (default) or 'diag'
 # -More             extra env overrides: -More @{VICTORY_PANEL='1'}
@@ -63,12 +63,13 @@ $settings = @{
     # Default display binding: Xbox Series S (XSS) + 1080p (override via -SeriesX / -More @{VICTORY_DISPLAY_MODE='...'})
     VICTORY_DISPLAY_MODE        = '1920x1080'
     # NVIDIA Ada / RTX 4090 specific tuning:
-    # - Keep default 1 MiB card buffer threshold (avoids 3,400+ tiny buffers / 6x GPU compare-pass overhead from 64 KiB; use -SmallCardBuffers to opt in)
+    # - Place >= 64 KiB title buffers directly in VRAM (matches cool_fox pareto-residency: -5 GiB SysRAM, -2.6 GiB shared, -8 ms copies)
     # - Keep ReBAR loose-window offload OFF by default (0) so 24 GiB VRAM stays reserved for textures & card buffers without spilling to shared SysRAM
     # - Disable AMD-specific synchronous MakeResident + Aside-queue fence wait (eliminates 60-85s stalls)
     # - Keep VICTORY_GROUP_SYNC at default (2) so looped compute shaders keep LDS GroupSync
     # - Keep VICTORY_FIRSTLANE_OWN=1 so all 53 XboxBvhBuilder shaders compile cleanly on NVIDIA Wave32 without busting shader cache across RT toggles
     # - Enable DXR 1.1 RT Core bridge only when -RayTracing is enabled (zero overhead when RT is off)
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     VICTORY_WINDOWS_BAR_MB      = '0'
     VICTORY_WAIT_RESIDENT       = '0'
     VICTORY_DXR                 = '0'

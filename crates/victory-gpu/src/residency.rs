@@ -146,12 +146,6 @@ pub(crate) fn critical_commit() -> bool {
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
 }
 
-/// True on <= 32 GiB RAM hosts when free physical RAM drops below 2 GiB,
-/// preventing speculative texture staging from pushing Windows into swap thrash.
-pub(crate) fn low_physical_ram() -> bool {
-    limited_host_ram() && headroom().is_some_and(|h| h < 2 * GIB)
-}
-
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {

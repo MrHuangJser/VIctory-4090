@@ -1334,21 +1334,14 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps unrelated title memory,
-            // read through the kernel instead. Even for `exact` (bake) passes,
-            // a complete kernel read (`read_into`) yields exact bytes with zero
-            // lock wait; only if this texture's own pages are mid-remap do we
-            // fall back to waiting on the global remap lock.
-            if let Some(mapped) = crate::watch::title_memory_reading_now() {
-                mapped
-            } else if !exact {
+        let _mapped = if no_wait() && !exact {
+            // Not waited for: while the runtime remaps title memory the
+            // texture is read through the kernel instead, whole or not at
+            // all (`no_wait`).
+            let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
-            } else if let Some(read) = self.refresh_unlocked_exact(last, size) {
-                return read;
-            } else {
-                waited(2, crate::watch::title_memory_reading)
-            }
+            };
+            mapped
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
@@ -1451,32 +1444,6 @@ impl Staging {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
             0
-        }
-    }
-
-    /// Lock-free exact refresh while the runtime is remapping unrelated title
-    /// memory: only succeeds if `read_into` captures all `size` bytes cleanly
-    /// through the kernel. If any page is unmapped (whether streamed-out or
-    /// temporarily unmapped mid-remap), returns `None` so the caller waits on
-    /// `title_memory_reading` instead of caching partial/zeroed bake bytes.
-    fn refresh_unlocked_exact(&self, last: &mut Last, size: usize) -> Option<usize> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let ok = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
-        if ok {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            Some(size)
-        } else {
-            None
         }
     }
 

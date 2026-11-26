@@ -2642,23 +2642,16 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        // Time-slice synchronous non-bake heap texture staging so opening/streaming
-        // spikes never stall the frame-recording thread for 25-60+ ms. Required
-        // decoration bakes override this via `PASS_BUDGET` with `bake_ms` (1500 ms).
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         }));
-        // A backlog (a scene's first minutes) gets a bounded 2x boost while host
-        // RAM is healthy, instead of 3x/750 ms which starved the GPU and spiked
-        // 32 GiB host RAM; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
+        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
+        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 && !crate::residency::pressured() {
-            (per_frame * 2, span * 2)
-        } else {
-            (per_frame, span)
-        };
+        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2676,7 +2669,7 @@ impl State {
             crate::residency::prefetch_limit(
                 bytes_at_most,
                 crate::residency::pressured(),
-                crate::residency::critical_commit() || crate::residency::low_physical_ram(),
+                crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
                 crate::texture::live_staging_bytes(),
             )

@@ -237,8 +237,9 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 ///
 /// Each idle list retains two D3D12 command allocators whose backing memory
 /// drivers do not shrink on Reset (~9 GB across 512 lists in long sessions).
-/// On hosts with <= 36 GiB physical RAM we default to 128 idle lists to avoid
-/// pagefile thrashing while keeping 512 on 64 GiB+ hosts.
+/// On hosts with <= 36 GiB physical RAM we default to 320 idle lists — enough
+/// to keep a full heavy frame (~250 lists) pooled with zero per-frame D3D12
+/// allocator recreation while still saving ~3.5 GB over 512 on 64 GiB+ hosts.
 #[cfg(windows)]
 fn idle_most() -> (usize, u64) {
     static MOST: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
@@ -246,7 +247,7 @@ fn idle_most() -> (usize, u64) {
         let count = std::env::var("VICTORY_LIST_POOL_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or_else(|| if crate::host::tight_ram() { 128 } else { 512 })
+            .unwrap_or_else(|| if crate::host::tight_ram() { 320 } else { 512 })
             .clamp(16, 2048);
         tracing::info!(idle_lists = count, "host command list pool limit (VICTORY_LIST_POOL_MAX)");
         (count, 256 << 20)
@@ -254,16 +255,16 @@ fn idle_most() -> (usize, u64) {
 }
 
 /// Trims oldest idle host lists (whose D3D12 command allocators never shrink on
-/// Reset) only when free physical RAM drops below 2 GiB, keeping a 64-list floor
-/// so steady-state frames avoid command allocator rebuild thrash.
+/// Reset) only under severe RAM pressure (< 2 GiB free), keeping at least 128
+/// lists above 1 GiB so steady-state frames avoid allocator rebuild thrash.
 #[cfg(windows)]
 pub(crate) fn trim_idle(avail_phys: Option<u64>) {
     let Some(avail) = avail_phys else { return };
     const GIB: u64 = 1 << 30;
     let target = if avail < GIB {
-        32
-    } else if avail < 2 * GIB {
         64
+    } else if avail < 2 * GIB {
+        128
     } else {
         return;
     };
