@@ -206,14 +206,14 @@ fn builds_per_frame() -> usize {
     })
 }
 
-/// Soft VRAM cap for cached native Ada BLASes before LRU eviction (default 512 MiB).
+/// Soft VRAM cap for cached native Ada BLASes before LRU eviction (default 256 MiB).
 fn vram_budget_bytes() -> u64 {
     static BYTES: OnceLock<u64> = OnceLock::new();
     *BYTES.get_or_init(|| {
         let mb = std::env::var("VICTORY_DXR_VRAM_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(512)
+            .unwrap_or(256)
             .clamp(64, 4096);
         mb << 20
     })
@@ -1453,9 +1453,9 @@ pub(crate) fn active_tlas_gpu_va() -> Option<u64> {
 #[derive(Clone, Copy)]
 struct ValidatedHeader {
     is_blas: bool,
-    size_nodes: u32,
+    size_bytes: u32,
     num_elements: u32,
-    offset_elements: u32,
+    offset_elements_bytes: u32,
     rev: u64,
     last_frame: u64,
 }
@@ -1470,9 +1470,21 @@ struct CachedBlas {
     last_built_rev: u64,
 }
 
+struct TlasBufferSlot {
+    resource: Option<(ID3D12Resource, u64)>,
+    busy_until_fence: u64,
+}
+
 struct RingSlot {
     allocator: ID3D12CommandAllocator,
     list4: ID3D12GraphicsCommandList4,
+    /// Per-slot shader-visible SRV heap so CPU `sync_copies` never mutates a
+    /// heap currently bound by an in-flight DXR command list on the GPU.
+    paged_heap: DxrPagedHeap,
+    /// Per-slot persistent-mapped BLAS VA hash table so CPU rebuilds never race
+    /// with an in-flight `CONVERT_INSTANCES_PAGED_CS` dispatch.
+    blas_map: BlasMapBuffer,
+    blas_map_rev: u64,
     addrs_buf: ID3D12Resource,
     addrs_ptr: *mut u64,
     headers_buf: ID3D12Resource,
@@ -1481,6 +1493,8 @@ struct RingSlot {
     stats_ptr: *mut u32,
     pending_inspect: Vec<(u64, CandidateKind, u8, u64)>,
     sample_tlas_slot: Option<(u64, usize)>,
+    /// Newly built TLAS waiting for this slot's fence before `ACTIVE_TLAS_VA` publication.
+    built_tlas: Option<(usize, u64, u64)>,
     ran_tlas: bool,
     kept_resources: Vec<ID3D12Resource>,
     fence_value: u64,
@@ -1492,17 +1506,15 @@ unsafe impl Send for RingSlot {}
 
 struct DxrRuntime {
     device5: ID3D12Device5,
-    paged_heap: DxrPagedHeap,
-    blas_map: BlasMapBuffer,
     slots: Vec<RingSlot>,
     next_slot: usize,
 
-    // Reusable scratch & ping-pong TLAS buffers (zero per-BLAS scratch bloat)
+    // Reusable scratch & fence-tracked TLAS ring buffers (zero per-BLAS scratch bloat)
     vb_scratch: Option<(ID3D12Resource, u64)>,
     as_scratch: Option<(ID3D12Resource, u64)>,
     tlas_descs: Option<(ID3D12Resource, u64)>,
-    tlas_results: [Option<(ID3D12Resource, u64)>; 2],
-    tlas_ping: usize,
+    tlas_ring: Vec<TlasBufferSlot>,
+    active_tlas_slot: Option<usize>,
 
     // Live validated BVH catalog and bounded Ada BLAS cache
     validated_blas: HashMap<u64, ValidatedHeader>,
@@ -1511,7 +1523,7 @@ struct DxrRuntime {
     blas_build_queued: HashSet<u64>,
     blas_cache: HashMap<u64, CachedBlas>,
     total_blas_bytes: u64,
-    blas_map_dirty: bool,
+    blas_map_rev: u64,
     primary_tlas: Option<u64>,
     sample_tlas_dumped: bool,
 
@@ -1550,8 +1562,16 @@ struct DxrRuntime {
 static DXR_RUNTIME: Mutex<Option<DxrRuntime>> = Mutex::new(None);
 static LAST_DXR_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Validates a 64-byte GPU-resident RDNA2 BVH header, distinguishing rejection reasons
-/// for bounded diagnostics and retry throttling.
+/// Validates a 64-byte GPU-resident RDNA2 XboxBvhBuilder v6 header, distinguishing
+/// rejection reasons for bounded diagnostics and retry throttling.
+///
+/// Observed v6 layout on live title structures:
+/// - `h[0]`: low 16 bits = version (`6`), high 16 bits = flags (`FLAG_BLAS`, `FLAG_PACKED`, `FLAG_COMPACTED`, `FLAG_REHYDRATED`)
+/// - `h[3]`: `num_elements` (64B triangle nodes for BLAS, 128B instance records for TLAS)
+/// - `h[10]`: total BVH size in **bytes** (64-byte aligned)
+/// - `h[13]`: byte offset from header start to the leaf/element array (64-byte aligned, `>= 64`)
+///
+/// Returns `Ok((is_blas, size_bytes, num_elements, offset_elements_bytes))`.
 fn inspect_rdna_header(h: &[u32; 16]) -> Result<(bool, u32, u32, u32), HeaderRejectReason> {
     if h.iter().all(|&w| w == 0) {
         return Err(HeaderRejectReason::AllZero);
@@ -1565,26 +1585,37 @@ fn inspect_rdna_header(h: &[u32; 16]) -> Result<(bool, u32, u32, u32), HeaderRej
         return Err(HeaderRejectReason::StillPacked);
     }
     let is_blas = flags & FLAG_BLAS != 0;
-    let size_nodes = h[1];
+    let size_bytes = h[10];
     let num_elements = h[3];
-    let offset_elements = h[13];
-    if size_nodes < 2 || size_nodes > 1_048_576 || num_elements == 0 || offset_elements == 0 {
-        return Err(HeaderRejectReason::BoundsOrEmpty);
-    }
-    if is_blas {
-        if num_elements > MAX_TRI_NODES || offset_elements.saturating_add(num_elements) > size_nodes + 1 {
-            return Err(HeaderRejectReason::BoundsOrEmpty);
-        }
-    } else if num_elements > MAX_INSTANCES
-        || offset_elements.saturating_add(num_elements.saturating_mul(2)) > size_nodes + 2
+    let offset_bytes = h[13];
+    if size_bytes < 128
+        || size_bytes > 64 * 1024 * 1024
+        || (size_bytes & 63) != 0
+        || num_elements == 0
+        || offset_bytes < HEADER_BYTES as u32
+        || (offset_bytes & 63) != 0
+        || offset_bytes >= size_bytes
     {
         return Err(HeaderRejectReason::BoundsOrEmpty);
     }
-    Ok((is_blas, size_nodes, num_elements, offset_elements))
+    let (max_elements, elem_stride) = if is_blas {
+        (MAX_TRI_NODES, NODE_BYTES)
+    } else {
+        (MAX_INSTANCES, INSTANCE_BYTES)
+    };
+    if num_elements > max_elements {
+        return Err(HeaderRejectReason::BoundsOrEmpty);
+    }
+    let elem_end = u64::from(offset_bytes)
+        .saturating_add(u64::from(num_elements).saturating_mul(elem_stride));
+    if elem_end > u64::from(size_bytes) {
+        return Err(HeaderRejectReason::BoundsOrEmpty);
+    }
+    Ok((is_blas, size_bytes, num_elements, offset_bytes))
 }
 
 /// Validates a 64-byte GPU-resident RDNA2 BVH header.
-/// Returns `Some((is_blas, size_nodes, num_elements, offset_elements))` if the
+/// Returns `Some((is_blas, size_bytes, num_elements, offset_elements_bytes))` if the
 /// header represents a live, unpacked, bounds-checked RDNA2 BLAS or TLAS.
 #[cfg(test)]
 fn parse_valid_rdna_header(h: &[u32; 16]) -> Option<(bool, u32, u32, u32)> {
@@ -1599,10 +1630,10 @@ fn log_raw_header(tag: &str, addr: u64, kind: CandidateKind, rebuilds: u64, h: &
         rebuilds,
         ver = h[0] & 0xFFFF,
         flags = format_args!("{:#06x}", h[0] >> 16),
-        d1_size = h[1],
-        d2 = h[2],
+        d1 = h[1],
         d3_elems = h[3],
-        d13_off = h[13],
+        d10_bytes = h[10],
+        d13_off_bytes = h[13],
         w0_7 = format_args!(
             "[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
@@ -1619,11 +1650,11 @@ impl DxrRuntime {
     fn new(host_gpu: &Host) -> Option<Self> {
         let device5 = host_gpu.device5()?;
         let _ = bridge(host_gpu)?;
-        let paged_heap = DxrPagedHeap::new(&host_gpu.device).ok()?;
-        let blas_map = BlasMapBuffer::new(host_gpu)?;
 
         let mut slots = Vec::with_capacity(RING_SLOTS);
         for i in 0..RING_SLOTS {
+            let paged_heap = DxrPagedHeap::new(&host_gpu.device).ok()?;
+            let blas_map = BlasMapBuffer::new(host_gpu)?;
             // SAFETY: plain D3D12 command allocator + command list4 creation.
             let (allocator, list4) = unsafe {
                 let alloc: ID3D12CommandAllocator = host_gpu
@@ -1648,6 +1679,9 @@ impl DxrRuntime {
             slots.push(RingSlot {
                 allocator,
                 list4,
+                paged_heap,
+                blas_map,
+                blas_map_rev: 0,
                 addrs_buf,
                 addrs_ptr: addrs_raw.cast::<u64>(),
                 headers_buf,
@@ -1656,11 +1690,19 @@ impl DxrRuntime {
                 stats_ptr: stats_raw.cast::<u32>(),
                 pending_inspect: Vec::new(),
                 sample_tlas_slot: None,
+                built_tlas: None,
                 ran_tlas: false,
                 kept_resources: Vec::new(),
                 fence_value: 0,
             });
         }
+
+        let tlas_ring = (0..RING_SLOTS + 1)
+            .map(|_| TlasBufferSlot {
+                resource: None,
+                busy_until_fence: 0,
+            })
+            .collect();
 
         tracing::info!(
             builds_per_frame = builds_per_frame(),
@@ -1671,22 +1713,20 @@ impl DxrRuntime {
 
         Some(Self {
             device5,
-            paged_heap,
-            blas_map,
             slots,
             next_slot: 0,
             vb_scratch: None,
             as_scratch: None,
             tlas_descs: None,
-            tlas_results: [None, None],
-            tlas_ping: 0,
+            tlas_ring,
+            active_tlas_slot: None,
             validated_blas: HashMap::new(),
             validated_tlas: HashMap::new(),
             blas_build_queue: VecDeque::new(),
             blas_build_queued: HashSet::new(),
             blas_cache: HashMap::new(),
             total_blas_bytes: 0,
-            blas_map_dirty: false,
+            blas_map_rev: 0,
             primary_tlas: None,
             sample_tlas_dumped: false,
             reject_counts: HashMap::new(),
@@ -1758,7 +1798,7 @@ impl DxrRuntime {
         );
     }
 
-    fn harvest_completed(&mut self, completed_fence: u64, frame: u64) {
+    fn harvest_completed(&mut self, completed_fence: u64, next_fence: u64, frame: u64) {
         // Release retired GPU resources whose fence has passed.
         self.retired.retain(|(f, _)| *f > completed_fence);
 
@@ -1777,6 +1817,23 @@ impl DxrRuntime {
                     self.last_tlas_culled = *slot.stats_ptr.add(1);
                 }
                 slot.ran_tlas = false;
+            }
+
+            if let Some((new_idx, tlas_addr, tlas_va)) = slot.built_tlas.take() {
+                // Keep the previously published TLAS buffer protected until any
+                // title lists already recorded against it finish (`next_fence`).
+                if let Some(old_idx) = self.active_tlas_slot
+                    && old_idx != new_idx
+                {
+                    let prev = &mut self.tlas_ring[old_idx];
+                    prev.busy_until_fence = prev.busy_until_fence.max(next_fence);
+                }
+                self.active_tlas_slot = Some(new_idx);
+                ACTIVE_TLAS_VA.store(tlas_va, Ordering::Release);
+                let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(reg) = reg.as_mut() {
+                    reg.tlas_vas.insert(tlas_addr, tlas_va);
+                }
             }
 
             if let Some((tlas_addr, base_idx)) = slot.sample_tlas_slot.take() {
@@ -1895,7 +1952,7 @@ impl DxrRuntime {
                         }
                         continue;
                     }
-                    Ok((is_blas, size_nodes, num_elements, offset_elements)) => {
+                    Ok((is_blas, size_bytes, num_elements, offset_elements_bytes)) => {
                         self.reject_counts.remove(&addr);
                         if !self.dumped_addrs.contains(&addr) {
                             if is_blas && self.dumped_valid_blas < 3 {
@@ -1918,9 +1975,9 @@ impl DxrRuntime {
                                 addr,
                                 ValidatedHeader {
                                     is_blas: true,
-                                    size_nodes,
+                                    size_bytes,
                                     num_elements,
-                                    offset_elements,
+                                    offset_elements_bytes,
                                     rev,
                                     last_frame: frame,
                                 },
@@ -1941,9 +1998,9 @@ impl DxrRuntime {
                                 addr,
                                 ValidatedHeader {
                                     is_blas: false,
-                                    size_nodes,
+                                    size_bytes,
                                     num_elements,
-                                    offset_elements,
+                                    offset_elements_bytes,
                                     rev,
                                     last_frame: frame,
                                 },
@@ -1990,14 +2047,15 @@ impl DxrRuntime {
             self.reject_counts.remove(&addr);
             self.dumped_addrs.remove(&addr);
         }
+        let retire_fence = next_fence.saturating_add(RING_SLOTS as u64);
         for addr in gone {
             self.validated_blas.remove(&addr);
             self.reject_counts.remove(&addr);
             self.dumped_addrs.remove(&addr);
             if let Some(cached) = self.blas_cache.remove(&addr) {
                 self.total_blas_bytes = self.total_blas_bytes.saturating_sub(cached.bytes);
-                self.retired.push((next_fence, cached.result));
-                self.blas_map_dirty = true;
+                self.retired.push((retire_fence, cached.result));
+                self.blas_map_rev = self.blas_map_rev.wrapping_add(1);
                 self.evictions_total += 1;
             }
         }
@@ -2010,8 +2068,8 @@ impl DxrRuntime {
             };
             if let Some(cached) = self.blas_cache.remove(&oldest_addr) {
                 self.total_blas_bytes = self.total_blas_bytes.saturating_sub(cached.bytes);
-                self.retired.push((next_fence, cached.result));
-                self.blas_map_dirty = true;
+                self.retired.push((retire_fence, cached.result));
+                self.blas_map_rev = self.blas_map_rev.wrapping_add(1);
                 self.evictions_total += 1;
             }
         }
@@ -2072,7 +2130,7 @@ impl DxrRuntime {
         completed_fence: u64,
         frame: u64,
     ) -> Option<ID3D12CommandList> {
-        self.harvest_completed(completed_fence, frame);
+        self.harvest_completed(completed_fence, next_fence, frame);
         self.process_evictions(next_fence);
 
         // Pick next ring slot; if still in flight on the GPU, skip this frame cleanly (zero stall).
@@ -2092,7 +2150,7 @@ impl DxrRuntime {
             && let Some(hdr) = self.validated_tlas.get(&tlas_addr)
             && hdr.num_elements > 0
         {
-            need_sample_tlas = Some((tlas_addr, tlas_addr + u64::from(hdr.offset_elements) * NODE_BYTES));
+            need_sample_tlas = Some((tlas_addr, tlas_addr + u64::from(hdr.offset_elements_bytes)));
         }
         let max_cands = MAX_INSPECT_PER_FRAME - if need_sample_tlas.is_some() { 2 } else { 0 };
         let is_muted = |addr: u64, counts: &HashMap<u64, u8>| {
@@ -2173,21 +2231,21 @@ impl DxrRuntime {
         }
 
         let bridge = bridge(host_gpu)?;
-        self.paged_heap.sync_copies(&host_gpu.device, &copies);
 
-        // Reset slot allocator + command list.
+        // Reset slot allocator + command list, and sync THIS idle slot's own SRV heap.
         let slot = &mut self.slots[slot_idx];
         // SAFETY: `slot.fence_value <= completed_fence` verified above.
+        slot.paged_heap.sync_copies(&host_gpu.device, &copies);
         unsafe {
             slot.allocator.Reset().ok()?;
             slot.list4.Reset(&slot.allocator, None).ok()?;
         }
         let list: ID3D12GraphicsCommandList = slot.list4.cast().ok()?;
-        // SAFETY: open command list; `paged_heap` lives for runtime lifetime.
+        // SAFETY: open command list; `slot.paged_heap` is owned by this slot until `next_fence`.
         unsafe {
-            list.SetDescriptorHeaps(&[Some(self.paged_heap.heap().clone())]);
+            list.SetDescriptorHeaps(&[Some(slot.paged_heap.heap().clone())]);
         }
-        let arenas_gpu = self.paged_heap.gpu_start();
+        let arenas_gpu = slot.paged_heap.gpu_start();
 
         // --- Stage 1: Async GPU Header Inspection ---
         let mut inspect_count = inspect_batch.len();
@@ -2222,8 +2280,9 @@ impl DxrRuntime {
         // --- Stage 2: Budgeted Paged Ada BLAS Builds ---
         let mut vb_in_srv = false;
         let mut rebuilt_any_blas = false;
+        let retire_fence = next_fence.saturating_add(RING_SLOTS as u64);
         for (addr, hdr) in blas_jobs {
-            let elem_addr = addr + u64::from(hdr.offset_elements) * NODE_BYTES;
+            let elem_addr = addr + u64::from(hdr.offset_elements_bytes);
             let tri_nodes = hdr.num_elements;
             let vert_count = tri_nodes * 4 * 3;
             let vb_bytes = u64::from(vert_count) * 12;
@@ -2345,123 +2404,132 @@ impl DxrRuntime {
                 },
             ) {
                 self.total_blas_bytes = self.total_blas_bytes.saturating_sub(old.bytes);
-                self.retired.push((next_fence, old.result));
+                self.retired.push((retire_fence, old.result));
             }
             self.total_blas_bytes += result_bytes;
-            if !self.blas_map.insert_one(addr, gpu_va) {
-                self.blas_map_dirty = true;
-            }
+            self.blas_map_rev = self.blas_map_rev.wrapping_add(1);
             self.blas_builds_total += 1;
             rebuilt_any_blas = true;
         }
 
-        if self.blas_map_dirty {
-            self.blas_map.rebuild(self.blas_cache.iter().map(|(&a, c)| (a, c.gpu_va)));
-            self.blas_map_dirty = false;
-        }
-
         // --- Stage 3: Live Paged Ada TLAS Build ---
         slot.ran_tlas = false;
+        slot.built_tlas = None;
         if let Some((tlas_addr, tlas_hdr)) = tlas_job {
-            let inst_count = tlas_hdr.num_elements;
-            let elem_addr = tlas_addr + u64::from(tlas_hdr.offset_elements) * NODE_BYTES;
-            let desc_bytes = (u64::from(inst_count) * DXR_INSTANCE_DESC_BYTES).max(256);
+            // Pick an idle TLAS ring slot that is neither currently published to
+            // title shaders nor still referenced by an in-flight submission.
+            let free_tlas_idx = self
+                .tlas_ring
+                .iter()
+                .enumerate()
+                .find(|(idx, s)| {
+                    Some(*idx) != self.active_tlas_slot && s.busy_until_fence <= completed_fence
+                })
+                .map(|(idx, _)| idx);
 
-            if let Some((descs, _)) = Self::ensure_scratch(
-                &mut self.tlas_descs,
-                &host_gpu.device,
-                desc_bytes,
-                D3D12_RESOURCE_STATE_COMMON,
-                "tlas descs scratch",
-                next_fence,
-                &mut self.retired,
-            ) {
-                // Zero the 8-byte resolved/culled counters before dispatch.
-                // SAFETY: `slot.stats_ptr` is idle because `slot.fence_value <= completed_fence`.
-                unsafe {
-                    *slot.stats_ptr = 0;
-                    *slot.stats_ptr.add(1) = 0;
+            if let Some(tlas_ring_idx) = free_tlas_idx {
+                if slot.blas_map_rev != self.blas_map_rev {
+                    slot.blas_map
+                        .rebuild(self.blas_cache.iter().map(|(&a, c)| (a, c.gpu_va)));
+                    slot.blas_map_rev = self.blas_map_rev;
                 }
-                bridge.dispatch_convert_instances_paged(
-                    &list,
-                    &directory,
-                    &self.blas_map.buffer,
-                    &descs,
-                    &slot.stats_buf,
-                    arenas_gpu,
-                    elem_addr,
-                    inst_count,
-                    self.blas_map.mask(),
-                    inst_mat_mode(),
-                );
-                // SAFETY: transition `descs` from UAV write to NON_PIXEL_SRV for TLAS builder.
-                let descs_va = unsafe {
-                    list.ResourceBarrier(&[
-                        transition(
-                            &descs,
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        ),
-                        uav_barrier(&slot.stats_buf),
-                    ]);
-                    descs.GetGPUVirtualAddress()
-                };
+                let inst_count = tlas_hdr.num_elements;
+                let elem_addr = tlas_addr + u64::from(tlas_hdr.offset_elements_bytes);
+                let desc_bytes = (u64::from(inst_count) * DXR_INSTANCE_DESC_BYTES).max(256);
 
-                let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                    Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                    NumDescs: inst_count,
-                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                        InstanceDescs: descs_va,
-                    },
-                };
-                let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
-                // SAFETY: valid inputs and output pointers.
-                unsafe {
-                    self.device5
-                        .GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info);
-                }
-                let ping = self.tlas_ping;
-                if let (Some(tlas_res), Some((scratch, _))) = (
-                    Self::ensure_tlas_result(
-                        &mut self.tlas_results[ping],
-                        &host_gpu.device,
-                        info.ResultDataMaxSizeInBytes,
-                        next_fence,
-                        &mut self.retired,
-                    ),
-                    Self::ensure_scratch(
-                        &mut self.as_scratch,
-                        &host_gpu.device,
-                        info.ScratchDataSizeInBytes,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        "as build scratch",
-                        next_fence,
-                        &mut self.retired,
-                    ),
+                if let Some((descs, _)) = Self::ensure_scratch(
+                    &mut self.tlas_descs,
+                    &host_gpu.device,
+                    desc_bytes,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    "tlas descs scratch",
+                    next_fence,
+                    &mut self.retired,
                 ) {
-                    // SAFETY: valid AS result, scratch, and descs buffers.
-                    let tlas_va = unsafe {
-                        let va = tlas_res.GetGPUVirtualAddress();
-                        let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-                            DestAccelerationStructureData: va,
-                            Inputs: inputs,
-                            SourceAccelerationStructureData: 0,
-                            ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
-                        };
-                        slot.list4.BuildRaytracingAccelerationStructure(&desc, None);
-                        list.ResourceBarrier(&[uav_barrier(&tlas_res), uav_barrier(&scratch)]);
-                        va
+                    // Zero the 8-byte resolved/culled counters before dispatch.
+                    // SAFETY: `slot.stats_ptr` is idle because `slot.fence_value <= completed_fence`.
+                    unsafe {
+                        *slot.stats_ptr = 0;
+                        *slot.stats_ptr.add(1) = 0;
+                    }
+                    bridge.dispatch_convert_instances_paged(
+                        &list,
+                        &directory,
+                        &slot.blas_map.buffer,
+                        &descs,
+                        &slot.stats_buf,
+                        arenas_gpu,
+                        elem_addr,
+                        inst_count,
+                        slot.blas_map.mask(),
+                        inst_mat_mode(),
+                    );
+                    // SAFETY: transition `descs` from UAV write to NON_PIXEL_SRV for TLAS builder.
+                    let descs_va = unsafe {
+                        list.ResourceBarrier(&[
+                            transition(
+                                &descs,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ),
+                            uav_barrier(&slot.stats_buf),
+                        ]);
+                        descs.GetGPUVirtualAddress()
                     };
-                    self.tlas_ping = 1 - ping;
-                    self.tlas_builds_total += 1;
-                    self.last_tlas_instances = inst_count;
-                    slot.ran_tlas = true;
-                    ACTIVE_TLAS_VA.store(tlas_va, Ordering::Release);
-                    let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(reg) = reg.as_mut() {
-                        reg.tlas_vas.insert(tlas_addr, tlas_va);
+
+                    let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                        Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                        Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                        NumDescs: inst_count,
+                        DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                        Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                            InstanceDescs: descs_va,
+                        },
+                    };
+                    let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+                    // SAFETY: valid inputs and output pointers.
+                    unsafe {
+                        self.device5
+                            .GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info);
+                    }
+                    if let (Some(tlas_res), Some((scratch, _))) = (
+                        Self::ensure_tlas_result(
+                            &mut self.tlas_ring[tlas_ring_idx].resource,
+                            &host_gpu.device,
+                            info.ResultDataMaxSizeInBytes,
+                            next_fence,
+                            &mut self.retired,
+                        ),
+                        Self::ensure_scratch(
+                            &mut self.as_scratch,
+                            &host_gpu.device,
+                            info.ScratchDataSizeInBytes,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            "as build scratch",
+                            next_fence,
+                            &mut self.retired,
+                        ),
+                    ) {
+                        // SAFETY: valid AS result, scratch, and descs buffers.
+                        let tlas_va = unsafe {
+                            let va = tlas_res.GetGPUVirtualAddress();
+                            let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                                DestAccelerationStructureData: va,
+                                Inputs: inputs,
+                                SourceAccelerationStructureData: 0,
+                                ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
+                            };
+                            slot.list4.BuildRaytracingAccelerationStructure(&desc, None);
+                            list.ResourceBarrier(&[uav_barrier(&tlas_res), uav_barrier(&scratch)]);
+                            va
+                        };
+                        self.tlas_ring[tlas_ring_idx].busy_until_fence = next_fence;
+                        self.tlas_builds_total += 1;
+                        self.last_tlas_instances = inst_count;
+                        slot.ran_tlas = true;
+                        // Defer `ACTIVE_TLAS_VA` publication until `next_fence` completes in
+                        // `harvest_completed` so concurrent list recorders never bind an unbuilt TLAS.
+                        slot.built_tlas = Some((tlas_ring_idx, tlas_addr, tlas_va));
                     }
                 }
             }
@@ -3842,33 +3910,45 @@ void main(uint3 id : SV_DispatchThreadID) {
         // All zero -> AllZero
         assert_eq!(inspect_rdna_header(&h), Err(HeaderRejectReason::AllZero));
 
-        // Valid unpacked BLAS
-        h[0] = 6 | (FLAG_BLAS << 16);
-        h[1] = 10;
-        h[3] = 4;
-        h[13] = 6;
-        assert_eq!(parse_valid_rdna_header(&h), Some((true, 10, 4, 6)));
+        // Valid unpacked BLAS (v6: h[10] = total bytes, h[13] = element byte offset)
+        // Mirrors live GTA 6 dynamic BLAS: 192 tri nodes at byte offset 768, total 13056 bytes
+        h[0] = 6 | ((FLAG_BLAS | FLAG_REHYDRATED) << 16);
+        h[3] = 192;
+        h[10] = 0x3300; // 768 + 192 * 64 = 13056
+        h[13] = 0x300; // 768 bytes
+        assert_eq!(parse_valid_rdna_header(&h), Some((true, 0x3300, 192, 0x300)));
+
+        // Live dynamic BLAS with +64B trailing padding (0x5040 + 1204*64 = 97600 <= 97664)
+        h[0] = 6 | ((FLAG_BLAS | FLAG_COMPACTED) << 16);
+        h[3] = 1204;
+        h[10] = 0x17d80;
+        h[13] = 0x5040;
+        assert_eq!(parse_valid_rdna_header(&h), Some((true, 0x17d80, 1204, 0x5040)));
 
         // Still packed -> StillPacked
         h[0] = 6 | ((FLAG_BLAS | FLAG_PACKED) << 16);
         assert_eq!(inspect_rdna_header(&h), Err(HeaderRejectReason::StillPacked));
         assert_eq!(parse_valid_rdna_header(&h), None);
 
-        // Valid unpacked TLAS (2 instances = 4 nodes)
+        // Valid unpacked TLAS (mirrors live GTA 6 walked TLAS: 658 instances * 128B at 0x8280)
         h[0] = 6;
-        h[1] = 10;
-        h[3] = 2;
-        h[13] = 6;
-        assert_eq!(parse_valid_rdna_header(&h), Some((false, 10, 2, 6)));
+        h[3] = 658;
+        h[10] = 0x1cb80; // 33408 + 658 * 128 = 117632
+        h[13] = 0x8280; // 33408 bytes
+        assert_eq!(parse_valid_rdna_header(&h), Some((false, 0x1cb80, 658, 0x8280)));
 
-        // Out-of-bounds offset_elements -> BoundsOrEmpty
-        h[13] = 9;
+        // Out-of-bounds offset_elements_bytes -> BoundsOrEmpty
+        h[13] = 0x8300; // 33536 + 658 * 128 > 117632
         assert_eq!(inspect_rdna_header(&h), Err(HeaderRejectReason::BoundsOrEmpty));
         assert_eq!(parse_valid_rdna_header(&h), None);
 
+        // Unaligned offset_elements_bytes -> BoundsOrEmpty
+        h[13] = 0x8284;
+        assert_eq!(inspect_rdna_header(&h), Err(HeaderRejectReason::BoundsOrEmpty));
+
         // Wrong version -> WrongVersion
         h[0] = 5;
-        h[13] = 6;
+        h[13] = 0x8280;
         assert_eq!(inspect_rdna_header(&h), Err(HeaderRejectReason::WrongVersion));
         assert_eq!(parse_valid_rdna_header(&h), None);
     }
@@ -3939,12 +4019,12 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let mut blas_hdr = [0u32; 16];
         blas_hdr[0] = 6 | (FLAG_BLAS << 16);
-        blas_hdr[1] = 6; // size_nodes
         blas_hdr[3] = 2; // 2 triangle nodes
-        blas_hdr[13] = 4; // 0x1_0000_FF00 + 4 * 64 = 0x1_0001_0000 (crosses into page 1 / arena1!)
+        blas_hdr[10] = 384; // 256 + 2 * 64 total bytes
+        blas_hdr[13] = 256; // 0x1_0000_FF00 + 256 = 0x1_0001_0000 (crosses into page 1 / arena1!)
 
         // TLAS at 0x2_0000_FF00 (page 0x2_0000 mapped in arena1@0x10000):
-        //   elem_offset = 3 -> elem_addr = 0x2_0000_FFC0 (64 bytes before page end!)
+        //   offset_elements_bytes = 192 -> elem_addr = 0x2_0000_FFC0 (64 bytes before page end!)
         //   Instance 0: bytes 0..63 at 0x2_0000_FFC0 (page 0x2_0000 / arena1), bytes 64..127 at 0x2_0001_0000 (page 0x2_0001 / arena0)
         //   Instance 1: at 0x2_0001_0040 (page 0x2_0001 / arena0) pointing to an UNBUILT BLAS -> must be culled!
         let tlas_title_addr: u64 = 0x2_0000_FF00;
@@ -3955,9 +4035,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let mut tlas_hdr = [0u32; 16];
         tlas_hdr[0] = 6; // version=6, BLAS=0, PACKED=0
-        tlas_hdr[1] = 8;
         tlas_hdr[3] = 2; // 2 instances
-        tlas_hdr[13] = 3; // 0x2_0000_FF00 + 3 * 64 = 0x2_0000_FFC0
+        tlas_hdr[10] = 448; // 192 + 2 * 128 total bytes
+        tlas_hdr[13] = 192; // 0x2_0000_FF00 + 192 = 0x2_0000_FFC0
 
         let mat_hit = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 4.0];
         let inst0 = make_rdna_instance(mat_hit, 77, 0xFF, 0, 0, 0, blas_title_addr);
@@ -4013,13 +4093,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             parse_valid_rdna_header(&h).expect("GPU-inspected TLAS header must validate")
         };
         let unmapped_hdr: [u32; 16] = unsafe { std::array::from_fn(|k| *hdrs_ptr.cast::<u32>().add(32 + k)) };
-        assert_eq!(parsed_blas, (true, 6, 2, 4));
-        assert_eq!(parsed_tlas, (false, 8, 2, 3));
+        assert_eq!(parsed_blas, (true, 384, 2, 256));
+        assert_eq!(parsed_tlas, (false, 448, 2, 192));
         assert_eq!(parse_valid_rdna_header(&unmapped_hdr), None);
 
         // Step 2: Run `EXTRACT_TRIANGLES_PAGED_CS` + build native Ada BLAS.
         let tri_nodes = parsed_blas.2;
-        let blas_elem_addr = blas_title_addr + u64::from(parsed_blas.3) * NODE_BYTES;
+        let blas_elem_addr = blas_title_addr + u64::from(parsed_blas.3);
         let vert_count = tri_nodes * 4 * 3;
         let vb = uav_buffer_state(&gpu.host.device, u64::from(vert_count) * 12, D3D12_RESOURCE_STATE_COMMON).unwrap();
         // SAFETY: open command list; paged_heap bound.
@@ -4090,7 +4170,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut blas_map = BlasMapBuffer::new(&gpu.host).unwrap();
         assert!(blas_map.insert_one(blas_title_addr, blas_va));
         let inst_count = parsed_tlas.2;
-        let tlas_elem_addr = tlas_title_addr + u64::from(parsed_tlas.3) * NODE_BYTES;
+        let tlas_elem_addr = tlas_title_addr + u64::from(parsed_tlas.3);
         let descs = uav_buffer_state(
             &gpu.host.device,
             u64::from(inst_count) * DXR_INSTANCE_DESC_BYTES,
