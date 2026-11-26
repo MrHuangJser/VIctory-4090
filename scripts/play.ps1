@@ -8,6 +8,8 @@
 # -Awake            enable async-compute clock keep-awake (off by default on NVIDIA)
 # -Build            target\diag (the default, with diagnostics) or target\release
 # -More             other settings: -More @{VICTORY_PANEL='1'}
+# -Log              custom log file path (outside repo; default: ..\captures\victory-YYYYMMDD-HHMMSS.log)
+# -NoLog            disable writing a log file (console only)
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -17,7 +19,9 @@ param(
     [switch]$SmallCardBuffers,
     [switch]$Awake,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [string]$Log = '',
+    [switch]$NoLog
 )
 $settings = @{
     # Core async & GPU-side optimizations (ported from VIctory-7900XTX and verified on RTX 4090 D)
@@ -77,4 +81,30 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+if (-not $NoLog) {
+    $logPath = if ($Log) {
+        $Log
+    } else {
+        Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path ("captures\victory-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $logPath) | Out-Null
+    Write-Host "Log: $logPath" -ForegroundColor Cyan
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $writer = New-Object System.IO.StreamWriter($logPath, $false, $enc)
+    $writer.AutoFlush = $true
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $victory run $Exe --execute 2>&1 | ForEach-Object {
+            $line = "$_"
+            Write-Host $line
+            $writer.WriteLine($line)
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
+        if ($writer) { $writer.Dispose() }
+        Pop-Location
+    }
+} else {
+    try { & $victory run $Exe --execute } finally { Pop-Location }
+}
